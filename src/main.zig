@@ -1,4 +1,5 @@
 const std = @import("std");
+const session = @import("session.zig");
 
 const CommandKind = enum {
     start,
@@ -81,58 +82,58 @@ const Spec = struct {
 };
 
 fn fail(
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     failure: *?ParseFailure,
     comptime fmt: []const u8,
     args: anytype,
 ) ParseErr {
-    failure.* = .{ .message = std.fmt.allocPrint(allocator, fmt, args) catch "invalid arguments" };
+    failure.* = .{ .message = std.fmt.allocPrint(gpa, fmt, args) catch "invalid arguments" };
     return error.InvalidArguments;
 }
 
 fn requireNext(
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     cur: *ArgCursor,
     failure: *?ParseFailure,
     what: []const u8,
 ) ParseErr![]const u8 {
-    return cur.next() orelse fail(allocator, failure, "missing {s}", .{what});
+    return cur.next() orelse fail(gpa, failure, "missing {s}", .{what});
 }
 
 fn requireNoMore(
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     cur: *ArgCursor,
     failure: *?ParseFailure,
 ) ParseErr!void {
     if (cur.next()) |arg| {
-        return fail(allocator, failure, "unexpected extra argument: '{s}'", .{arg});
+        return fail(gpa, failure, "unexpected extra argument: '{s}'", .{arg});
     }
 }
 
 fn takeRestJoined(
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     cur: *ArgCursor,
     failure: *?ParseFailure,
     what: []const u8,
 ) ParseErr![]const u8 {
     if (!cur.hasMore()) {
-        return fail(allocator, failure, "missing {s}", .{what});
+        return fail(gpa, failure, "missing {s}", .{what});
     }
 
     const parts = cur.rest();
-    return std.mem.join(allocator, " ", parts) catch {
-        return fail(allocator, failure, "failed to allocate {s}", .{what});
+    return std.mem.join(gpa, " ", parts) catch {
+        return fail(gpa, failure, "failed to allocate {s}", .{what});
     };
 }
 
 fn parseIndex(
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     s: []const u8,
     failure: *?ParseFailure,
 ) ParseErr!usize {
     return std.fmt.parseUnsigned(usize, s, 10) catch {
         return fail(
-            allocator,
+            gpa,
             failure,
             "invalid todo index: '{s}' (expected a positive integer)",
             .{s},
@@ -141,7 +142,7 @@ fn parseIndex(
 }
 
 fn parseArgs(
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     args: []const []const u8,
     failure: *?ParseFailure,
 ) ParseErr!Parsed {
@@ -158,22 +159,22 @@ fn parseArgs(
         std.mem.eql(u8, first, "-h"))
     {
         parsed.show_help = true;
-        try requireNoMore(allocator, &cur, failure);
+        try requireNoMore(gpa, &cur, failure);
         return parsed;
     }
 
     if (std.mem.eql(u8, first, "start")) {
-        const name = try takeRestJoined(allocator, &cur, failure, "session name");
+        const name = try takeRestJoined(gpa, &cur, failure, "session name");
         parsed.command = .{ .start = .{ .name = name } };
         return parsed;
     }
 
     if (std.mem.eql(u8, first, "todo")) {
-        const sub = try requireNext(allocator, &cur, failure, "todo subcommand ('add' or 'done')");
+        const sub = try requireNext(gpa, &cur, failure, "todo subcommand ('add' or 'done')");
 
         if (std.mem.eql(u8, sub, "add")) {
             const desc = try takeRestJoined(
-                allocator,
+                gpa,
                 &cur,
                 failure,
                 "todo description",
@@ -183,29 +184,29 @@ fn parseArgs(
         }
 
         if (std.mem.eql(u8, sub, "done")) {
-            const raw_index = try requireNext(allocator, &cur, failure, "todo index");
-            const index = try parseIndex(allocator, raw_index, failure);
-            try requireNoMore(allocator, &cur, failure);
+            const raw_index = try requireNext(gpa, &cur, failure, "todo index");
+            const index = try parseIndex(gpa, raw_index, failure);
+            try requireNoMore(gpa, &cur, failure);
             parsed.command = .{ .todo_done = .{ .index = index } };
             return parsed;
         }
 
-        return fail(allocator, failure, "unknown todo subcommand: '{s}' (expected 'add' or 'done')", .{sub});
+        return fail(gpa, failure, "unknown todo subcommand: '{s}' (expected 'add' or 'done')", .{sub});
     }
 
     if (std.mem.eql(u8, first, "status")) {
-        try requireNoMore(allocator, &cur, failure);
+        try requireNoMore(gpa, &cur, failure);
         parsed.command = .{ .status = {} };
         return parsed;
     }
 
     if (std.mem.eql(u8, first, "end")) {
-        try requireNoMore(allocator, &cur, failure);
+        try requireNoMore(gpa, &cur, failure);
         parsed.command = .{ .end = {} };
         return parsed;
     }
 
-    return fail(allocator, failure, "unknown command: '{s}'", .{first});
+    return fail(gpa, failure, "unknown command: '{s}'", .{first});
 }
 
 fn printUsage(spec: Spec, w: *std.Io.Writer) !void {
@@ -224,13 +225,15 @@ fn printUsage(spec: Spec, w: *std.Io.Writer) !void {
 }
 
 fn run(
-    allocator: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     spec: Spec,
     args: []const []const u8,
     stdout_writer: *std.Io.File.Writer,
+    env: *const std.process.Environ.Map,
+    io: std.Io,
 ) !void {
     var parse_failure: ?ParseFailure = null;
-    const parsed = parseArgs(allocator, args, &parse_failure) catch |err| switch (err) {
+    const parsed = parseArgs(gpa, args, &parse_failure) catch |err| switch (err) {
         error.InvalidArguments => {
             const msg = if (parse_failure) |pf| pf.message else "invalid arguments";
             try stdout_writer.interface.print("error: {s}\n\n", .{msg});
@@ -247,13 +250,58 @@ fn run(
     const cmd = parsed.command orelse unreachable;
 
     // dispatch
-    try dispatch(cmd, &stdout_writer.interface);
+    try dispatch(
+        gpa,
+        cmd,
+        &stdout_writer.interface,
+        env,
+        io,
+    );
 }
 
-fn dispatch(cmd: CommandData, w: *std.Io.Writer) !void {
+fn dispatch(
+    gpa: std.mem.Allocator,
+    cmd: CommandData,
+    w: *std.Io.Writer,
+    env: *const std.process.Environ.Map,
+    io: std.Io,
+) !void {
     switch (cmd) {
         .start => |c| {
-            try w.print("command: start, name={s}\n", .{c.name});
+            const options = try session.SessionOptions.fromEnvironment(gpa, env);
+            defer options.deinit(gpa);
+
+            session.start(
+                gpa,
+                options,
+                c.name,
+                io,
+            ) catch |err| switch (err) {
+                error.InvalidSessionName => {
+                    try w.writeAll("error: invalid session name\n");
+                    try w.flush();
+                    return;
+                },
+                error.SessionAlreadyActive => {
+                    const current = try session.currentSessionName(
+                        gpa,
+                        options,
+                        io,
+                    );
+                    defer if (current) |name| gpa.free(name);
+
+                    if (current) |name| {
+                        try w.print("error: a session is already active: {s}\n", .{name});
+                    } else {
+                        try w.writeAll("error: a session is already active\n");
+                    }
+                    try w.flush();
+                    return;
+                },
+                else => return err,
+            };
+
+            try w.print("started session: {s}\n", .{c.name});
         },
         .todo_add => |c| {
             try w.print("command: todo add, description={s}\n", .{c.description});
@@ -273,12 +321,12 @@ fn dispatch(cmd: CommandData, w: *std.Io.Writer) !void {
 
 pub fn main(init: std.process.Init) !void {
     // setup
-    const arena: std.mem.Allocator = init.arena.allocator();
+    const gpa: std.mem.Allocator = init.arena.allocator();
 
     var stdout_buf: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buf);
 
-    const args = try init.minimal.args.toSlice(arena);
+    const args = try init.minimal.args.toSlice(gpa);
 
     const spec = Spec{
         .name = "sess",
@@ -286,5 +334,5 @@ pub fn main(init: std.process.Init) !void {
         .commands = &commands,
     };
 
-    try run(arena, spec, args, &stdout_writer);
+    try run(gpa, spec, args, &stdout_writer, init.environ_map, init.io);
 }
