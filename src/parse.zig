@@ -4,6 +4,10 @@ const CommandKind = enum {
     start,
     todo_add,
     todo_done,
+    todo_delete,
+    todo_undo,
+    notes,
+    open,
     status,
     end,
 };
@@ -18,8 +22,25 @@ pub const CommandData = union(CommandKind) {
     todo_done: struct {
         index: usize,
     },
+    todo_delete: struct {
+        index: usize,
+    },
+    todo_undo: struct {
+        index: usize,
+    },
+    notes: struct {
+        content: []const u8,
+    },
+    open: struct {
+        target: OpenTarget,
+    },
     status: void,
     end: void,
+};
+
+pub const OpenTarget = enum {
+    notes,
+    todo,
 };
 
 const Parsed = struct {
@@ -36,6 +57,8 @@ const Command = struct {
 pub const commands = [_]Command{
     .{ .name = "start", .usage = "sess start <name>", .help = "start a session" },
     .{ .name = "todo", .usage = "sess todo add <description>", .help = "manage todos" },
+    .{ .name = "notes", .usage = "sess notes <text>", .help = "append to session notes" },
+    .{ .name = "open", .usage = "sess open [notes|todo]", .help = "open notes or todos in editor" },
     .{ .name = "status", .usage = "sess status", .help = "show session status" },
     .{ .name = "end", .usage = "sess end", .help = "end the current session" },
 };
@@ -184,7 +207,7 @@ pub fn parseArgs(
     }
 
     if (std.mem.eql(u8, first, "todo")) {
-        const sub = try requireNext(gpa, &cur, failure, "todo subcommand ('add' or 'done')");
+        const sub = try requireNext(gpa, &cur, failure, "todo subcommand ('add', 'done', 'delete', or 'undo')");
 
         if (std.mem.eql(u8, sub, "add")) {
             const desc = try takeRestJoined(
@@ -205,7 +228,46 @@ pub fn parseArgs(
             return parsed;
         }
 
-        return fail(gpa, failure, "unknown todo subcommand: '{s}' (expected 'add' or 'done')", .{sub});
+        if (std.mem.eql(u8, sub, "delete")) {
+            const raw_index = try requireNext(gpa, &cur, failure, "todo index");
+            const index = try parseIndex(gpa, raw_index, failure);
+            try requireNoMore(gpa, &cur, failure);
+            parsed.command = .{ .todo_delete = .{ .index = index } };
+            return parsed;
+        }
+
+        if (std.mem.eql(u8, sub, "undo")) {
+            const raw_index = try requireNext(gpa, &cur, failure, "todo index");
+            const index = try parseIndex(gpa, raw_index, failure);
+            try requireNoMore(gpa, &cur, failure);
+            parsed.command = .{ .todo_undo = .{ .index = index } };
+            return parsed;
+        }
+
+        return fail(
+            gpa,
+            failure,
+            "unknown todo subcommand: '{s}' (expected 'add', 'done', 'delete', or 'undo')",
+            .{sub},
+        );
+    }
+
+    if (std.mem.eql(u8, first, "notes")) {
+        const content = try takeRestJoined(gpa, &cur, failure, "notes content");
+        parsed.command = .{ .notes = .{ .content = content } };
+        return parsed;
+    }
+
+    if (std.mem.eql(u8, first, "open")) {
+        const target = if (cur.peek()) |arg| blk: {
+            _ = cur.next();
+            if (std.mem.eql(u8, arg, "notes")) break :blk OpenTarget.notes;
+            if (std.mem.eql(u8, arg, "todo")) break :blk OpenTarget.todo;
+            return fail(gpa, failure, "unknown open target: '{s}' (expected 'notes' or 'todo')", .{arg});
+        } else OpenTarget.notes;
+        try requireNoMore(gpa, &cur, failure);
+        parsed.command = .{ .open = .{ .target = target } };
+        return parsed;
     }
 
     if (std.mem.eql(u8, first, "status")) {
@@ -255,4 +317,36 @@ test "rejects extra arguments for status" {
 
     try std.testing.expectError(error.InvalidArguments, parseArgs(gpa, &args, &failure));
     try std.testing.expect(failure != null);
+}
+
+test "parses notes command by consuming the remaining input" {
+    const gpa = std.testing.allocator;
+    var failure: ?ParseFailure = null;
+    const args = [_][]const u8{ "sess", "notes", "investigate", "api", "drift" };
+
+    const parsed = try parseArgs(gpa, &args, &failure);
+    try std.testing.expectEqualStrings("investigate api drift", parsed.command.?.notes.content);
+}
+
+test "parses open command defaulting to notes" {
+    const gpa = std.testing.allocator;
+    var failure: ?ParseFailure = null;
+    const args = [_][]const u8{ "sess", "open" };
+
+    const parsed = try parseArgs(gpa, &args, &failure);
+    try std.testing.expectEqual(OpenTarget.notes, parsed.command.?.open.target);
+}
+
+test "parses todo delete and undo commands" {
+    const gpa = std.testing.allocator;
+    var failure: ?ParseFailure = null;
+
+    const delete_args = [_][]const u8{ "sess", "todo", "delete", "2" };
+    const delete_parsed = try parseArgs(gpa, &delete_args, &failure);
+    try std.testing.expectEqual(@as(usize, 2), delete_parsed.command.?.todo_delete.index);
+
+    failure = null;
+    const undo_args = [_][]const u8{ "sess", "todo", "undo", "4" };
+    const undo_parsed = try parseArgs(gpa, &undo_args, &failure);
+    try std.testing.expectEqual(@as(usize, 4), undo_parsed.command.?.todo_undo.index);
 }

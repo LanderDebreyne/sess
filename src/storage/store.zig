@@ -123,6 +123,22 @@ pub const SessionStore = struct {
         try self.writeSessionFile(name, "todos.txt", contents);
     }
 
+    pub fn readNotes(self: SessionStore, name: []const u8) ![]u8 {
+        return self.readSessionFile(name, "notes.md", 1 << 20);
+    }
+
+    pub fn writeNotes(self: SessionStore, name: []const u8, contents: []const u8) !void {
+        try self.writeSessionFile(name, "notes.md", contents);
+    }
+
+    pub fn notesPath(self: SessionStore, name: []const u8) ![]u8 {
+        return self.sessionFilePath(name, "notes.md");
+    }
+
+    pub fn todosPath(self: SessionStore, name: []const u8) ![]u8 {
+        return self.sessionFilePath(name, "todos.txt");
+    }
+
     pub fn appendLog(self: SessionStore, name: []const u8, line: []const u8) !void {
         const existing = self.readSessionFile(name, "log.txt", 1 << 20) catch |err| switch (err) {
             error.FileNotFound => try self.gpa.dupe(u8, ""),

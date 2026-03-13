@@ -98,6 +98,120 @@ pub fn dispatch(
             );
         },
 
+        .todo_delete => |c| {
+            var result = session.todoDelete(gpa, options, c.index, io) catch |err| switch (err) {
+                error.NoActiveSession => {
+                    try w.writeAll("error: no active session\n");
+                    try w.flush();
+                    return;
+                },
+                error.InvalidTodoIndex => {
+                    try w.print("error: invalid todo index: {}\n", .{c.index});
+                    try w.flush();
+                    return;
+                },
+                error.CorruptSessionState => {
+                    try w.writeAll("error: active session state is corrupt\n");
+                    try w.flush();
+                    return;
+                },
+                else => return err,
+            };
+            defer result.deinit(gpa);
+
+            try w.print("deleted todo {}: {s}\n", .{ c.index, result.description });
+        },
+
+        .todo_undo => |c| {
+            var result = session.todoUndo(gpa, options, c.index, io) catch |err| switch (err) {
+                error.NoActiveSession => {
+                    try w.writeAll("error: no active session\n");
+                    try w.flush();
+                    return;
+                },
+                error.InvalidTodoIndex => {
+                    try w.print("error: invalid todo index: {}\n", .{c.index});
+                    try w.flush();
+                    return;
+                },
+                error.TodoAlreadyOpen => {
+                    try w.print("error: todo already open: {}\n", .{c.index});
+                    try w.flush();
+                    return;
+                },
+                error.CorruptSessionState => {
+                    try w.writeAll("error: active session state is corrupt\n");
+                    try w.flush();
+                    return;
+                },
+                else => return err,
+            };
+            defer result.deinit(gpa);
+
+            try w.print("reopened todo {}: {s}\n", .{ c.index, result.description });
+        },
+
+        .notes => |c| {
+            session.notesAppend(gpa, options, c.content, io) catch |err| switch (err) {
+                error.NoActiveSession => {
+                    try w.writeAll("error: no active session\n");
+                    try w.flush();
+                    return;
+                },
+                error.EmptyNotesContent => {
+                    try w.writeAll("error: notes content cannot be empty\n");
+                    try w.flush();
+                    return;
+                },
+                error.CorruptSessionState => {
+                    try w.writeAll("error: active session state is corrupt\n");
+                    try w.flush();
+                    return;
+                },
+                else => return err,
+            };
+
+            try w.print("appended note: {s}\n", .{c.content});
+        },
+
+        .open => |c| {
+            const target = switch (c.target) {
+                .notes => session.OpenTarget.notes,
+                .todo => session.OpenTarget.todo,
+            };
+            const path = session.openTargetPath(gpa, options, target, io) catch |err| switch (err) {
+                error.NoActiveSession => {
+                    try w.writeAll("error: no active session\n");
+                    try w.flush();
+                    return;
+                },
+                else => return err,
+            };
+            defer gpa.free(path);
+
+            const editor = env.get("EDITOR") orelse "nvim";
+            var child = try std.process.spawn(io, .{
+                .argv = &.{ editor, path },
+                .environ_map = env,
+                .stdin = .inherit,
+                .stdout = .inherit,
+                .stderr = .inherit,
+            });
+            switch (try child.wait(io)) {
+                .exited => |code| {
+                    if (code != 0) {
+                        try w.print("error: editor exited with status {}\n", .{code});
+                    }
+                },
+                .signal => |sig| {
+                    try w.print("error: editor terminated by signal {}\n", .{@intFromEnum(sig)});
+                },
+                .stopped, .unknown => |code| {
+                    try w.print("error: editor terminated unexpectedly ({})\n", .{code});
+                },
+            }
+        },
+
         .status => {
             const s = try session.currentStatus(gpa, options, io);
             defer if (s) |status| status.deinit(gpa);
@@ -117,6 +231,7 @@ pub fn dispatch(
                     try w.print("warning: {s}\n", .{warning});
                 }
                 try w.print("todos:\n{s}", .{status.todos});
+                try w.print("notes:\n{s}", .{status.notes});
             } else {
                 try w.writeAll("no active session\n");
             }
