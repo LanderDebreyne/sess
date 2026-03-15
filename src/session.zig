@@ -59,10 +59,12 @@ pub const SessionSummary = struct {
 pub const TodoDoneResult = struct {
     description: []u8,
     elapsed_since_start: []u8,
+    elapsed_since_last_done: []u8,
 
     pub fn deinit(self: TodoDoneResult, gpa: std.mem.Allocator) void {
         gpa.free(self.description);
         gpa.free(self.elapsed_since_start);
+        gpa.free(self.elapsed_since_last_done);
     }
 };
 
@@ -441,6 +443,7 @@ fn todoDoneAt(
 
     if (index > items.len) return error.InvalidTodoIndex;
 
+    const previous_done_seconds = latestDoneSeconds(items);
     var item = &items[index - 1];
     if (item.state == .done) return error.TodoAlreadyDone;
 
@@ -454,11 +457,20 @@ fn todoDoneAt(
 
     const elapsed = try time.formatDurationHuman(gpa, elapsed_seconds);
     errdefer gpa.free(elapsed);
+    const elapsed_since_last_done_seconds = if (previous_done_seconds) |done_seconds|
+        if (now_seconds >= done_seconds)
+            @as(u64, @intCast(now_seconds - done_seconds))
+        else
+            0
+    else
+        elapsed_seconds;
+    const elapsed_since_last_done = try time.formatDurationHuman(gpa, elapsed_since_last_done_seconds);
+    errdefer gpa.free(elapsed_since_last_done);
 
     const log_line = try std.fmt.allocPrint(
         gpa,
-        "[{s}] todo completed (#{d}) after {s}: {s}\n",
-        .{ now_iso, index, elapsed, item.description },
+        "[{s}] todo completed (#{d}) at {s}, done in {s}: {s}\n",
+        .{ now_iso, index, elapsed, elapsed_since_last_done, item.description },
     );
     defer gpa.free(log_line);
     try s.appendLog(name, log_line);
@@ -466,6 +478,7 @@ fn todoDoneAt(
     return .{
         .description = try gpa.dupe(u8, item.description),
         .elapsed_since_start = elapsed,
+        .elapsed_since_last_done = elapsed_since_last_done,
     };
 }
 
@@ -741,7 +754,7 @@ fn currentStatusAt(
 
     return .{
         .name = name,
-        .created_at = try gpa.dupe(u8, created_at),
+        .created_at = time.formatIso8601UtcLocal(gpa, created_at) catch try gpa.dupe(u8, created_at),
         .state = try gpa.dupe(u8, if (is_corrupt) "corrupt" else "active"),
         .elapsed = elapsed,
         .since_last_done = since_last_done,
@@ -788,9 +801,15 @@ fn listSessionsAt(
         const meta = try parseMeta(meta_text);
         try summaries.append(gpa, .{
             .name = try gpa.dupe(u8, meta.name orelse name),
-            .created_at = try gpa.dupe(u8, meta.created_at orelse "unknown"),
+            .created_at = if (meta.created_at) |created_at|
+                time.formatIso8601UtcLocal(gpa, created_at) catch try gpa.dupe(u8, created_at)
+            else
+                try gpa.dupe(u8, "unknown"),
             .status = try gpa.dupe(u8, meta.status orelse "unknown"),
-            .ended_at = if (meta.ended_at) |ended_at| try gpa.dupe(u8, ended_at) else null,
+            .ended_at = if (meta.ended_at) |ended_at|
+                time.formatIso8601UtcLocal(gpa, ended_at) catch try gpa.dupe(u8, ended_at)
+            else
+                null,
             .is_current = if (current) |value| std.mem.eql(u8, value, name) else false,
         });
     }
@@ -954,7 +973,9 @@ test "list sessions includes current and ended sessions" {
     try std.testing.expectEqualStrings("beta", sessions[1].name);
     try std.testing.expect(!sessions[1].is_current);
     try std.testing.expectEqualStrings("ended", sessions[1].status);
-    try std.testing.expectEqualStrings("2026-03-13T11:00:00Z", sessions[1].ended_at.?);
+    try expectLocalTimestampFormat(sessions[0].created_at);
+    try expectLocalTimestampFormat(sessions[1].created_at);
+    try expectLocalTimestampFormat(sessions[1].ended_at.?);
 }
 
 test "remove deletes an ended session" {
@@ -974,6 +995,29 @@ test "remove deletes an ended session" {
     try std.testing.expect(!(try store.SessionStore.init(gpa, std.testing.io, options).sessionExists("alpha")));
 }
 
+test "remove deletes ended session while another session remains active" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const options = try testOptions(gpa, tmp.sub_path[0..]);
+    defer options.deinit(gpa);
+
+    try startAt(gpa, options, "alpha", "2026-03-13T10:00:00Z", std.testing.io);
+    var alpha_ended = try endAt(gpa, options, "2026-03-13T11:00:00Z", std.testing.io);
+    defer alpha_ended.deinit(gpa);
+
+    try startAt(gpa, options, "beta", "2026-03-13T12:00:00Z", std.testing.io);
+
+    try removeAt(gpa, options, "alpha", std.testing.io);
+
+    try std.testing.expect(!(try store.SessionStore.init(gpa, std.testing.io, options).sessionExists("alpha")));
+
+    const current = (try currentSessionName(gpa, options, std.testing.io)).?;
+    defer gpa.free(current);
+    try std.testing.expectEqualStrings("beta", current);
+}
+
 test "status includes elapsed values and todo completion timing" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -990,16 +1034,45 @@ test "status includes elapsed values and todo completion timing" {
 
     try std.testing.expectEqualStrings("first task", result.description);
     try std.testing.expectEqualStrings("1h 2m 3s", result.elapsed_since_start);
+    try std.testing.expectEqualStrings("1h 2m 3s", result.elapsed_since_last_done);
 
     const status = (try currentStatusAt(gpa, options, "2026-03-14T12:02:04Z", std.testing.io)).?;
     defer status.deinit(gpa);
 
     try std.testing.expectEqualStrings("active", status.state);
+    try expectLocalTimestampFormat(status.created_at);
     try std.testing.expectEqualStrings("1d 2h 2m 4s", status.elapsed);
     try std.testing.expect(status.since_last_done != null);
     try std.testing.expectEqualStrings("1d 1h 0m 1s", status.since_last_done.?);
-    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "1. [x] first task (done after 1h 2m 3s)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "1. [x] first task (1h 2m 3s: done in 1h 2m 3s)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, status.notes, 1, "# Notes"));
+}
+
+test "second completed todo shows time since previous completion and session start" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const options = try testOptions(gpa, tmp.sub_path[0..]);
+    defer options.deinit(gpa);
+
+    try startAt(gpa, options, "alpha", "2026-03-13T10:00:00Z", std.testing.io);
+    try todoAdd(gpa, options, "first task", std.testing.io);
+    try todoAdd(gpa, options, "second task", std.testing.io);
+
+    var first = try todoDoneAt(gpa, options, 1, "2026-03-13T10:00:12Z", std.testing.io);
+    defer first.deinit(gpa);
+    var second = try todoDoneAt(gpa, options, 2, "2026-03-13T10:02:16Z", std.testing.io);
+    defer second.deinit(gpa);
+
+    try std.testing.expectEqualStrings("2m 16s", second.elapsed_since_start);
+    try std.testing.expectEqualStrings("2m 4s", second.elapsed_since_last_done);
+
+    const status = (try currentStatusAt(gpa, options, "2026-03-13T10:02:16Z", std.testing.io)).?;
+    defer status.deinit(gpa);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "1. [x] first task (12s: done in 12s)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "2. [x] second task (2m 16s: done in 2m 4s)"));
 }
 
 test "todo cannot be completed twice" {
@@ -1135,4 +1208,16 @@ fn testOptions(gpa: std.mem.Allocator, tmp_sub_path: []const u8) !SessionOptions
             .{tmp_sub_path},
         ),
     };
+}
+
+fn expectLocalTimestampFormat(value: []const u8) !void {
+    try std.testing.expectEqual(@as(usize, 16), value.len);
+    try std.testing.expectEqual(@as(u8, '/'), value[2]);
+    try std.testing.expectEqual(@as(u8, '/'), value[5]);
+    try std.testing.expectEqual(@as(u8, ' '), value[10]);
+    try std.testing.expectEqual(@as(u8, ':'), value[13]);
+
+    for ([_]usize{ 0, 1, 3, 4, 6, 7, 8, 9, 11, 12, 14, 15 }) |i| {
+        try std.testing.expect(std.ascii.isDigit(value[i]));
+    }
 }

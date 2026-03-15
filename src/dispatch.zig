@@ -1,6 +1,7 @@
 const parse = @import("parse.zig");
 const std = @import("std");
 const session = @import("session.zig");
+const store = @import("storage/store.zig");
 
 const SessionConflictAction = enum {
     start,
@@ -143,8 +144,8 @@ pub fn dispatch(
             defer result.deinit(gpa);
 
             try w.print(
-                "completed todo {} after {s}: {s}\n",
-                .{ c.index, result.elapsed_since_start, result.description },
+                "completed todo {} at {s}, done in {s}: {s}\n",
+                .{ c.index, result.elapsed_since_start, result.elapsed_since_last_done, result.description },
             );
         },
 
@@ -437,17 +438,63 @@ fn handleRemove(
     name: []const u8,
 ) !void {
     while (true) {
-        session.removeSession(gpa, options, name, io) catch |err| switch (err) {
-            error.SessionAlreadyActive => {},
-            else => return err,
+        const completed = blk: {
+            session.removeSession(gpa, options, name, io) catch |err| switch (err) {
+                error.SessionAlreadyActive => break :blk false,
+                else => return err,
+            };
+            break :blk true;
         };
 
-        const confirmed = try confirmReplaceActiveSession(w, io, name, .remove, name);
+        if (completed) return;
+
+        const current = try session.currentSessionName(gpa, options, io);
+        defer if (current) |value| gpa.free(value);
+
+        const current_name = current orelse return error.SessionAlreadyActive;
+        const confirmed = try confirmReplaceActiveSession(w, io, current_name, .remove, name);
         if (!confirmed) return error.Cancelled;
 
         const ended = try session.end(gpa, options, io);
         ended.deinit(gpa);
     }
+}
+
+test "handle remove deletes ended session without prompting when another session is active" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const options = try testOptions(gpa, tmp.sub_path[0..]);
+    defer options.deinit(gpa);
+
+    try session.start(gpa, options, "alpha", std.testing.io);
+    var alpha_ended = try session.end(gpa, options, std.testing.io);
+    defer alpha_ended.deinit(gpa);
+
+    try session.start(gpa, options, "beta", std.testing.io);
+
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+
+    try handleRemove(gpa, &output.writer, options, std.testing.io, "alpha");
+
+    try std.testing.expectEqualStrings("", output.written());
+    try std.testing.expect(!(try store.SessionStore.init(gpa, std.testing.io, options).sessionExists("alpha")));
+
+    const current = (try session.currentSessionName(gpa, options, std.testing.io)).?;
+    defer gpa.free(current);
+    try std.testing.expectEqualStrings("beta", current);
+}
+
+fn testOptions(gpa: std.mem.Allocator, tmp_sub_path: []const u8) !session.SessionOptions {
+    return .{
+        .state_home = try std.fmt.allocPrint(
+            gpa,
+            ".zig-cache/tmp/{s}/state",
+            .{tmp_sub_path},
+        ),
+    };
 }
 
 test "parse confirmation accepts yes and no" {

@@ -1,4 +1,8 @@
 const std = @import("std");
+const c = @cImport({
+    @cInclude("stdlib.h");
+    @cInclude("time.h");
+});
 
 pub fn nowIso8601Utc(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     return formatUnixTimestampIso8601Utc(gpa, std.Io.Clock.now(.real, io));
@@ -59,6 +63,27 @@ pub fn parseIso8601Utc(value: []const u8) !i64 {
 
     const days = daysFromCivil(year, month, day);
     return days * 86_400 + hour * 3_600 + minute * 60 + second;
+}
+
+pub fn formatIso8601UtcLocal(gpa: std.mem.Allocator, value: []const u8) ![]u8 {
+    return formatUnixSecondsLocal(gpa, try parseIso8601Utc(value));
+}
+
+pub fn formatUnixSecondsLocal(gpa: std.mem.Allocator, ts: i64) ![]u8 {
+    var local_time: c.time_t = @intCast(ts);
+    var local_tm: c.struct_tm = undefined;
+    const local_tm_ptr = c.localtime_r(&local_time, &local_tm) orelse return error.UnsupportedTimestamp;
+    const day: u8 = @intCast(local_tm_ptr.*.tm_mday);
+    const month: u8 = @intCast(local_tm_ptr.*.tm_mon + 1);
+    const year: u16 = @intCast(local_tm_ptr.*.tm_year + 1900);
+    const hour: u8 = @intCast(local_tm_ptr.*.tm_hour);
+    const minute: u8 = @intCast(local_tm_ptr.*.tm_min);
+
+    return std.fmt.allocPrint(
+        gpa,
+        "{d:0>2}/{d:0>2}/{d:0>4} {d:0>2}:{d:0>2}",
+        .{ day, month, year, hour, minute },
+    );
 }
 
 fn formatUnixTimestampIso8601Utc(allocator: std.mem.Allocator, now: std.Io.Timestamp) ![]u8 {
@@ -128,4 +153,14 @@ test "formats human duration" {
 
 test "parses iso8601 timestamp" {
     try std.testing.expectEqual(@as(i64, 1_710_242_523), try parseIso8601Utc("2024-03-12T11:22:03Z"));
+}
+
+test "formats local timestamp in requested shape" {
+    _ = c.setenv("TZ", "UTC", 1);
+    c.tzset();
+
+    const rendered = try formatIso8601UtcLocal(std.testing.allocator, "2026-03-13T11:22:03Z");
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expectEqualStrings("13/03/2026 11:22", rendered);
 }
