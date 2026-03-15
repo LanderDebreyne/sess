@@ -163,6 +163,10 @@ pub const SessionStore = struct {
         try self.writeSessionFile(name, "notes.md", contents);
     }
 
+    pub fn readLog(self: SessionStore, name: []const u8) ![]u8 {
+        return self.readSessionFile(name, "log.txt", 1 << 20);
+    }
+
     pub fn notesPath(self: SessionStore, name: []const u8) ![]u8 {
         return self.sessionFilePath(name, "notes.md");
     }

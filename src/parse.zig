@@ -13,6 +13,14 @@ const CommandKind = enum {
     list,
     status,
     end,
+    overlay_serve,
+};
+
+const OverlayServe = struct {
+    port: u16 = 47831,
+    rotate_seconds: u16 = 15,
+    notes_scroll_seconds: u16 = 22,
+    timeline_scroll_seconds: u16 = 18,
 };
 
 pub const CommandData = union(CommandKind) {
@@ -46,6 +54,7 @@ pub const CommandData = union(CommandKind) {
     list: void,
     status: void,
     end: void,
+    overlay_serve: OverlayServe,
 };
 
 pub const OpenTarget = enum {
@@ -74,6 +83,7 @@ pub const commands = [_]Command{
     .{ .name = "list", .usage = "sess list", .help = "list saved sessions" },
     .{ .name = "status", .usage = "sess status", .help = "show session status" },
     .{ .name = "end", .usage = "sess end", .help = "end the current session" },
+    .{ .name = "overlay", .usage = "sess overlay serve [--port <n>] [--rotate-seconds <n>] [--notes-scroll-seconds <n>] [--timeline-scroll-seconds <n>]", .help = "serve a local OBS overlay" },
 };
 
 const ArgCursor = struct {
@@ -173,6 +183,17 @@ fn parseIndex(
             "invalid todo index: '{s}' (expected a positive integer)",
             .{s},
         );
+    };
+}
+
+fn parseU16(
+    gpa: std.mem.Allocator,
+    s: []const u8,
+    failure: *?ParseFailure,
+    label: []const u8,
+) ParseErr!u16 {
+    return std.fmt.parseUnsigned(u16, s, 10) catch {
+        return fail(gpa, failure, "invalid {s}: '{s}' (expected 0-65535)", .{ label, s });
     };
 }
 
@@ -313,6 +334,38 @@ pub fn parseArgs(
         return parsed;
     }
 
+    if (std.mem.eql(u8, first, "overlay")) {
+        const sub = try requireNext(gpa, &cur, failure, "overlay subcommand ('serve')");
+        if (!std.mem.eql(u8, sub, "serve")) {
+            return fail(gpa, failure, "unknown overlay subcommand: '{s}' (expected 'serve')", .{sub});
+        }
+
+        var serve: OverlayServe = .{};
+        while (cur.peek()) |arg| {
+            _ = cur.next();
+            if (std.mem.eql(u8, arg, "--port")) {
+                serve.port = try parseU16(gpa, try requireNext(gpa, &cur, failure, "port"), failure, "port");
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--rotate-seconds")) {
+                serve.rotate_seconds = try parseU16(gpa, try requireNext(gpa, &cur, failure, "rotate seconds"), failure, "rotate seconds");
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--notes-scroll-seconds")) {
+                serve.notes_scroll_seconds = try parseU16(gpa, try requireNext(gpa, &cur, failure, "notes scroll seconds"), failure, "notes scroll seconds");
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--timeline-scroll-seconds")) {
+                serve.timeline_scroll_seconds = try parseU16(gpa, try requireNext(gpa, &cur, failure, "timeline scroll seconds"), failure, "timeline scroll seconds");
+                continue;
+            }
+            return fail(gpa, failure, "unknown overlay flag: '{s}'", .{arg});
+        }
+
+        parsed.command = .{ .overlay_serve = serve };
+        return parsed;
+    }
+
     return fail(gpa, failure, "unknown command: '{s}'", .{first});
 }
 
@@ -422,4 +475,39 @@ test "parses todo delete and undo commands" {
     const undo_args = [_][]const u8{ "sess", "todo", "undo", "4" };
     const undo_parsed = try parseArgs(gpa, &undo_args, &failure);
     try std.testing.expectEqual(@as(usize, 4), undo_parsed.command.?.todo_undo.index);
+}
+
+test "parses overlay serve with defaults" {
+    const gpa = std.testing.allocator;
+    var failure: ?ParseFailure = null;
+    const args = [_][]const u8{ "sess", "overlay", "serve" };
+
+    const parsed = try parseArgs(gpa, &args, &failure);
+    try std.testing.expectEqual(@as(u16, 47831), parsed.command.?.overlay_serve.port);
+    try std.testing.expectEqual(@as(u16, 15), parsed.command.?.overlay_serve.rotate_seconds);
+}
+
+test "parses overlay serve flags" {
+    const gpa = std.testing.allocator;
+    var failure: ?ParseFailure = null;
+    const args = [_][]const u8{
+        "sess",
+        "overlay",
+        "serve",
+        "--port",
+        "49000",
+        "--rotate-seconds",
+        "12",
+        "--notes-scroll-seconds",
+        "30",
+        "--timeline-scroll-seconds",
+        "24",
+    };
+
+    const parsed = try parseArgs(gpa, &args, &failure);
+    const overlay = parsed.command.?.overlay_serve;
+    try std.testing.expectEqual(@as(u16, 49000), overlay.port);
+    try std.testing.expectEqual(@as(u16, 12), overlay.rotate_seconds);
+    try std.testing.expectEqual(@as(u16, 30), overlay.notes_scroll_seconds);
+    try std.testing.expectEqual(@as(u16, 24), overlay.timeline_scroll_seconds);
 }

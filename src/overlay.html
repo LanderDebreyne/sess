@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sess overlay</title>
+  <style>
+    :root {
+      --bg: rgba(8, 12, 18, 0.58);
+      --bg-strong: rgba(10, 16, 24, 0.8);
+      --fg: #ecf4ee;
+      --muted: rgba(236, 244, 238, 0.62);
+      --accent: #8fd3b6;
+      --accent-strong: #d8ff87;
+      --line: rgba(255, 255, 255, 0.12);
+      --warn: #ffcf87;
+      --radius: 28px;
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.38);
+      --mono: "SF Mono", "JetBrains Mono", "IBM Plex Mono", monospace;
+      --sans: "SF Pro Display", "Avenir Next", "Helvetica Neue", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      background: transparent;
+      color: var(--fg);
+      font-family: var(--sans);
+      overflow: hidden;
+    }
+    body {
+      display: grid;
+      place-items: center;
+      padding: 20px;
+    }
+    .shell {
+      width: min(1280px, 96vw);
+      height: min(720px, 88vh);
+      position: relative;
+      overflow: hidden;
+      border-radius: calc(var(--radius) + 8px);
+      border: 1px solid var(--line);
+      background:
+        radial-gradient(circle at top left, rgba(143, 211, 182, 0.18), transparent 34%),
+        radial-gradient(circle at bottom right, rgba(216, 255, 135, 0.15), transparent 28%),
+        linear-gradient(145deg, rgba(255,255,255,0.06), rgba(255,255,255,0.015)),
+        var(--bg);
+      backdrop-filter: blur(24px) saturate(140%);
+      box-shadow: var(--shadow);
+    }
+    .chrome {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent),
+        linear-gradient(transparent 0 31px, rgba(255,255,255,0.03) 32px);
+      opacity: 0.35;
+      mask-image: linear-gradient(to bottom, rgba(0,0,0,0.75), transparent 82%);
+    }
+    .hud {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      padding: 28px;
+    }
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      font-family: var(--mono);
+      font-size: 14px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .panel-stack {
+      display: grid;
+      position: relative;
+      min-height: 0;
+      margin: 0 0 22px;
+      border-radius: var(--radius);
+      border: 1px solid rgba(255,255,255,0.08);
+      background: linear-gradient(180deg, rgba(10,16,24,0.36), rgba(10,16,24,0.6));
+      overflow: hidden;
+    }
+    .panel {
+      grid-area: 1 / 1;
+      padding: 34px;
+      min-width: 0;
+      min-height: 0;
+      opacity: 0;
+      visibility: hidden;
+      transform: translateY(16px) scale(0.985);
+      transition: opacity 500ms ease, transform 500ms ease;
+      pointer-events: none;
+      color: var(--fg);
+      z-index: 0;
+    }
+    .panel.is-active {
+      opacity: 1;
+      visibility: visible;
+      transform: translateY(0) scale(1);
+      z-index: 1;
+    }
+    .eyebrow {
+      font-family: var(--mono);
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
+      font-size: 12px;
+      margin-bottom: 22px;
+    }
+    .title-panel {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 24px;
+      align-content: stretch;
+    }
+    .title-session {
+      font-size: clamp(48px, 7vw, 110px);
+      line-height: 0.92;
+      font-weight: 700;
+      letter-spacing: -0.045em;
+      max-width: 10ch;
+      text-wrap: balance;
+    }
+    .title-empty {
+      max-width: 14ch;
+      color: rgba(236,244,238,0.8);
+    }
+    .title-summary {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .metric {
+      min-width: 160px;
+      padding: 16px 18px;
+      border-radius: 18px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .metric-label {
+      font-family: var(--mono);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+    .metric-value {
+      font-size: clamp(20px, 2vw, 30px);
+      line-height: 1.1;
+    }
+    .warning {
+      color: var(--warn);
+      font-family: var(--mono);
+      font-size: 13px;
+      max-width: 70ch;
+    }
+    .scroll-panel {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 10px;
+      min-height: 0;
+    }
+    .scroll-window {
+      position: relative;
+      min-height: 0;
+      overflow: hidden;
+      border-radius: 20px;
+      background: rgba(255,255,255,0.025);
+      border: 1px solid rgba(255,255,255,0.06);
+      padding: 18px 22px;
+    }
+    .scroll-track {
+      will-change: transform;
+    }
+    .scroll-copy + .scroll-copy {
+      margin-top: 36px;
+      padding-top: 36px;
+      border-top: 1px solid rgba(255,255,255,0.08);
+    }
+    .notes {
+      font-size: clamp(18px, 1.65vw, 28px);
+      line-height: 1.55;
+      color: rgba(236,244,238,0.94);
+    }
+    .notes h1, .notes h2, .notes h3 {
+      margin: 0 0 0.7em;
+      line-height: 1.05;
+      letter-spacing: -0.04em;
+    }
+    .notes p, .notes ul, .notes pre {
+      margin: 0 0 0.9em;
+    }
+    .notes ul {
+      padding-left: 1.2em;
+    }
+    .notes code {
+      font-family: var(--mono);
+      padding: 0.12em 0.32em;
+      border-radius: 0.35em;
+      background: rgba(255,255,255,0.08);
+    }
+    .notes pre {
+      padding: 18px;
+      overflow: hidden;
+      white-space: pre-wrap;
+      border-radius: 18px;
+      background: rgba(7, 10, 15, 0.82);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .todo-list {
+      display: grid;
+      gap: 14px;
+    }
+    .todo-item {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 12px 18px;
+      align-items: start;
+      padding: 14px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+    }
+    .todo-item:last-child {
+      border-bottom: 0;
+    }
+    .todo-index {
+      color: var(--accent-strong);
+      font-family: var(--mono);
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      white-space: nowrap;
+    }
+    .todo-body {
+      display: grid;
+      gap: 6px;
+    }
+    .todo-meta {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .todo-state {
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-size: 12px;
+      font-family: var(--mono);
+      color: var(--muted);
+    }
+    .todo-state.is-open {
+      color: var(--accent);
+    }
+    .todo-state.is-done {
+      color: var(--accent-strong);
+    }
+    .todo-text {
+      font-size: clamp(18px, 1.55vw, 24px);
+      line-height: 1.35;
+    }
+    .todo-detail {
+      color: var(--muted);
+      font-size: 14px;
+      font-family: var(--mono);
+    }
+    .footer {
+      gap: 12px;
+      align-items: flex-end;
+    }
+    .panel-indicators {
+      display: flex;
+      gap: 10px;
+    }
+    .panel-indicator {
+      width: 36px;
+      height: 6px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.15);
+      transition: transform 300ms ease, background 300ms ease;
+    }
+    .panel-indicator.is-active {
+      transform: scaleX(1.25);
+      background: var(--accent);
+    }
+    @media (max-width: 820px) {
+      body { padding: 10px; }
+      .hud { padding: 18px; }
+      .panel { padding: 22px; }
+      .title-summary { display: grid; grid-template-columns: 1fr 1fr; }
+      .footer { font-size: 11px; gap: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="chrome"></div>
+    <section class="hud">
+      <div class="panel-stack" id="panel-stack">
+        <section class="panel title-panel is-active" data-panel="title" data-panel-key="title">
+          <div class="title-session title-empty" id="session-title">No active session</div>
+          <div>
+            <div class="title-summary">
+              <div class="metric">
+                <div class="metric-label">Elapsed</div>
+                <div class="metric-value" id="elapsed">0s</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">Open todos</div>
+                <div class="metric-value" id="open-count">0</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">Completed</div>
+                <div class="metric-value" id="done-count">0</div>
+              </div>
+            </div>
+            <p class="warning" id="warning"></p>
+          </div>
+        </section>
+        <section class="panel scroll-panel" data-panel="notes" data-panel-key="notes">
+          <div class="eyebrow">Notes stream</div>
+          <div class="scroll-window">
+            <div class="scroll-track" id="notes-track"></div>
+          </div>
+        </section>
+      </div>
+      <footer class="footer">
+        <div class="panel-indicators" id="panel-indicators"></div>
+      </footer>
+    </section>
+  </main>
+  <script>
+    const panelStack = document.getElementById("panel-stack");
+    const indicatorBar = document.getElementById("panel-indicators");
+    const stateEls = {
+      sessionTitle: document.getElementById("session-title"),
+      elapsed: document.getElementById("elapsed"),
+      openCount: document.getElementById("open-count"),
+      doneCount: document.getElementById("done-count"),
+      warning: document.getElementById("warning"),
+      notesTrack: document.getElementById("notes-track"),
+    };
+    let panels = [];
+    let indicators = [];
+    let currentPanel = 0;
+    let rotateTimer = null;
+    let rotateSeconds = 0;
+    const scrollers = new Map();
+    function escapeHtml(text) {
+      return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+    function renderInlineMarkdown(text) {
+      return escapeHtml(text)
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/\*([^*]+)\*/g, "<em>$1</em>");
+    }
+    function renderMarkdown(markdown) {
+      const lines = markdown.replace(/\r/g, "").split("\n");
+      const chunks = [];
+      let paragraph = [];
+      let list = [];
+      let inCode = false;
+      let codeLines = [];
+      function flushParagraph() {
+        if (!paragraph.length) return;
+        chunks.push(`<p>${renderInlineMarkdown(paragraph.join(" "))}</p>`);
+        paragraph = [];
+      }
+      function flushList() {
+        if (!list.length) return;
+        chunks.push(`<ul>${list.map(item => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ul>`);
+        list = [];
+      }
+      function flushCode() {
+        if (!codeLines.length) return;
+        chunks.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+        codeLines = [];
+      }
+      for (const line of lines) {
+        if (line.startsWith("```")) {
+          flushParagraph();
+          flushList();
+          if (inCode) flushCode();
+          inCode = !inCode;
+          continue;
+        }
+        if (inCode) {
+          codeLines.push(line);
+          continue;
+        }
+        const heading = line.match(/^(#{1,3})\s+(.*)$/);
+        if (heading) {
+          flushParagraph();
+          flushList();
+          chunks.push(`<h${heading[1].length}>${renderInlineMarkdown(heading[2])}</h${heading[1].length}>`);
+          continue;
+        }
+        const bullet = line.match(/^[-*]\s+(.*)$/);
+        if (bullet) {
+          flushParagraph();
+          list.push(bullet[1]);
+          continue;
+        }
+        if (line.trim() === "") {
+          flushParagraph();
+          flushList();
+          continue;
+        }
+        paragraph.push(line.trim());
+      }
+      flushParagraph();
+      flushList();
+      flushCode();
+      return chunks.join("") || "<p>Nothing in notes yet.</p>";
+    }
+    function renderTodos(todos) {
+      if (!todos.length) {
+        return `<div class="todo-list"><div class="todo-item"><div class="todo-index">--</div><div class="todo-body"><div class="todo-meta"><div class="todo-state is-open">idle</div></div><div class="todo-text">No todos yet.</div></div></div></div>`;
+      }
+      return `<div class="todo-list">` + todos.map((todo) => `
+        <article class="todo-item">
+          <div class="todo-index">#${todo.index}</div>
+          <div class="todo-body">
+            <div class="todo-meta">
+              <div class="todo-state ${todo.state === "done" ? "is-done" : "is-open"}">${escapeHtml(todo.state)}</div>
+              ${todo.done_at ? `<div class="todo-detail">done ${escapeHtml(todo.done_at)}</div>` : ""}
+              ${todo.elapsed ? `<div class="todo-detail">at ${escapeHtml(todo.elapsed)}</div>` : ""}
+              ${todo.done_in ? `<div class="todo-detail">in ${escapeHtml(todo.done_in)}</div>` : ""}
+            </div>
+            <div class="todo-text">${escapeHtml(todo.description)}</div>
+          </div>
+        </article>
+      `).join("") + `</div>`;
+    }
+    function chunkTodos(todos, size) {
+      const pages = [];
+      for (let i = 0; i < todos.length; i += size) pages.push(todos.slice(i, i + size));
+      return pages.length ? pages : [[]];
+    }
+    function renderTodoPanels(todos) {
+      const contentKey = JSON.stringify(todos || []);
+      if (panelStack.dataset.todoKey === contentKey) return;
+      const activeKey = panels[currentPanel]?.dataset.panelKey || "title";
+      for (const panel of panelStack.querySelectorAll('[data-panel="todos"]')) panel.remove();
+      const pages = chunkTodos(todos || [], 4);
+      pages.forEach((page, index) => {
+        const section = document.createElement("section");
+        section.className = "panel scroll-panel";
+        section.dataset.panel = "todos";
+        section.dataset.panelKey = `todos-${index}`;
+        section.innerHTML = `
+          <div class="eyebrow">Todo page ${index + 1}/${pages.length}</div>
+          <div class="scroll-window">
+            ${renderTodos(page)}
+          </div>
+        `;
+        panelStack.appendChild(section);
+      });
+      panelStack.dataset.todoKey = contentKey;
+      refreshPanels(activeKey);
+    }
+    function refreshPanels(preferredKey) {
+      panels = [...panelStack.querySelectorAll(".panel")];
+      indicatorBar.innerHTML = panels.map(() => `<span class="panel-indicator"></span>`).join("");
+      indicators = [...indicatorBar.querySelectorAll(".panel-indicator")];
+      const preferredIndex = preferredKey ? panels.findIndex((panel) => panel.dataset.panelKey === preferredKey) : -1;
+      setPanel(preferredIndex >= 0 ? preferredIndex : Math.min(currentPanel, Math.max(0, panels.length - 1)));
+    }
+    function startLoop(track, seconds) {
+      stopLoop(track);
+      const content = track.firstElementChild;
+      if (!content) return;
+      const cycleHeight = content.offsetHeight;
+      if (!cycleHeight || cycleHeight <= track.parentElement.clientHeight) {
+        track.style.transform = "translateY(0)";
+        return;
+      }
+      let startTime = null;
+      const durationMs = Math.max(6000, seconds * 1000);
+      function frame(timestamp) {
+        if (startTime === null) startTime = timestamp;
+        const progress = ((timestamp - startTime) % durationMs) / durationMs;
+        const offset = progress * cycleHeight;
+        track.style.transform = `translateY(${-offset}px)`;
+        const id = requestAnimationFrame(frame);
+        scrollers.set(track, id);
+      }
+      const id = requestAnimationFrame(frame);
+      scrollers.set(track, id);
+    }
+    function stopLoop(track) {
+      const id = scrollers.get(track);
+      if (id) cancelAnimationFrame(id);
+      scrollers.delete(track);
+      track.style.transform = "translateY(0)";
+    }
+    function setScrollableContent(track, innerHtml, className, seconds) {
+      const contentKey = `${className}:${seconds}:${innerHtml}`;
+      if (track.dataset.contentKey === contentKey) return;
+      track.dataset.contentKey = contentKey;
+      track.innerHTML = `
+        <div class="scroll-copy ${className}">${innerHtml}</div>
+        <div class="scroll-copy ${className}" aria-hidden="true">${innerHtml}</div>
+      `;
+      requestAnimationFrame(() => startLoop(track, seconds));
+    }
+    function setPanel(index) {
+      if (!panels.length) return;
+      currentPanel = ((index % panels.length) + panels.length) % panels.length;
+      panels.forEach((panel, i) => panel.classList.toggle("is-active", i === currentPanel));
+      indicators.forEach((indicator, i) => indicator.classList.toggle("is-active", i === currentPanel));
+    }
+    function configureRotation(seconds) {
+      if (rotateTimer && rotateSeconds === seconds) return;
+      if (rotateTimer) clearInterval(rotateTimer);
+      rotateSeconds = seconds;
+      rotateTimer = setInterval(() => setPanel(currentPanel + 1), Math.max(4, seconds) * 1000);
+    }
+    function applyState(data) {
+      const hasSession = Boolean(data.session_name);
+      stateEls.sessionTitle.textContent = hasSession ? data.session_name : "No active session";
+      stateEls.sessionTitle.classList.toggle("title-empty", !hasSession);
+      stateEls.elapsed.textContent = data.elapsed;
+      stateEls.openCount.textContent = String(data.open_todos.length);
+      stateEls.doneCount.textContent = String(data.done_count);
+      stateEls.warning.textContent = data.warning || "";
+      renderTodoPanels(data.todos || []);
+      setScrollableContent(stateEls.notesTrack, `<div class="notes">${renderMarkdown(data.notes_markdown || "")}</div>`, "notes", data.ui.notes_scroll_seconds);
+      configureRotation(data.ui.rotate_seconds);
+    }
+    async function poll() {
+      try {
+        const response = await fetch("/api/state", { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        applyState(data);
+      } catch (error) {
+        stateEls.warning.textContent = String(error);
+      }
+    }
+    refreshPanels("title");
+    poll();
+    setInterval(poll, 1000);
+  </script>
+</body>
+</html>

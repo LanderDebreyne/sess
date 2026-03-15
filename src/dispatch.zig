@@ -1,6 +1,7 @@
 const parse = @import("parse.zig");
 const std = @import("std");
 const session = @import("session.zig");
+const overlay = @import("overlay.zig");
 const store = @import("storage/store.zig");
 
 const SessionConflictAction = enum {
@@ -333,6 +334,15 @@ pub fn dispatch(
             } else {
                 try w.print("ended session: {s}\n", .{ended.name});
             }
+        },
+
+        .overlay_serve => |c| {
+            try overlay.serve(gpa, options, .{
+                .port = c.port,
+                .rotate_seconds = c.rotate_seconds,
+                .notes_scroll_seconds = c.notes_scroll_seconds,
+                .timeline_scroll_seconds = c.timeline_scroll_seconds,
+            }, io, w);
         },
     }
     try w.flush();
