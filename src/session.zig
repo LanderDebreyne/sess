@@ -11,6 +11,19 @@ pub const StartError = error{
     SessionNameExists,
 };
 
+pub const ResumeError = error{
+    InvalidSessionName,
+    SessionAlreadyActive,
+    SessionNotFound,
+    AlreadyCurrentSession,
+};
+
+pub const RemoveError = error{
+    InvalidSessionName,
+    SessionAlreadyActive,
+    SessionNotFound,
+};
+
 pub const SessionError = error{
     NoActiveSession,
     EmptyTodoDescription,
@@ -26,6 +39,21 @@ const SessionMeta = struct {
     created_at: []const u8,
     status: []const u8,
     ended_at: ?[]const u8 = null,
+};
+
+pub const SessionSummary = struct {
+    name: []u8,
+    created_at: []u8,
+    status: []u8,
+    ended_at: ?[]u8,
+    is_current: bool,
+
+    pub fn deinit(self: SessionSummary, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        gpa.free(self.created_at);
+        gpa.free(self.status);
+        if (self.ended_at) |value| gpa.free(value);
+    }
 };
 
 pub const TodoDoneResult = struct {
@@ -100,6 +128,27 @@ pub fn start(
     defer gpa.free(created_at);
 
     try startAt(gpa, options, name, created_at, io);
+}
+
+pub fn resumeSession(
+    gpa: std.mem.Allocator,
+    options: SessionOptions,
+    name: []const u8,
+    io: std.Io,
+) !void {
+    const now = try time.nowIso8601Utc(gpa, io);
+    defer gpa.free(now);
+
+    try resumeAt(gpa, options, name, now, io);
+}
+
+pub fn removeSession(
+    gpa: std.mem.Allocator,
+    options: SessionOptions,
+    name: []const u8,
+    io: std.Io,
+) !void {
+    try removeAt(gpa, options, name, io);
 }
 
 pub fn todoAdd(
@@ -217,6 +266,14 @@ pub fn currentSessionName(
     return store.SessionStore.init(gpa, io, options).currentSessionName();
 }
 
+pub fn listSessions(
+    gpa: std.mem.Allocator,
+    options: SessionOptions,
+    io: std.Io,
+) ![]SessionSummary {
+    return listSessionsAt(gpa, options, io);
+}
+
 pub fn openTargetPath(
     gpa: std.mem.Allocator,
     options: SessionOptions,
@@ -269,6 +326,80 @@ fn startAt(
 
     try s.createSession(name, meta_contents, log_contents);
     try s.setCurrent(name);
+}
+
+fn resumeAt(
+    gpa: std.mem.Allocator,
+    options: SessionOptions,
+    name: []const u8,
+    now_iso: []const u8,
+    io: std.Io,
+) !void {
+    try validateSessionName(name);
+
+    const s = store.SessionStore.init(gpa, io, options);
+    try s.ensureBaseDirs();
+
+    if (try s.currentSessionName()) |current| {
+        defer gpa.free(current);
+        if (std.mem.eql(u8, current, name)) return error.AlreadyCurrentSession;
+        return error.SessionAlreadyActive;
+    }
+    if (!try s.sessionExists(name)) {
+        return error.SessionNotFound;
+    }
+
+    const meta_text = s.readMeta(name) catch |err| switch (err) {
+        error.FileNotFound => try std.fmt.allocPrint(
+            gpa,
+            "name: {s}\ncreated_at: {s}\nstatus: ended\n",
+            .{ name, now_iso },
+        ),
+        else => return err,
+    };
+    defer gpa.free(meta_text);
+
+    const parsed_meta = try parseMeta(meta_text);
+    const updated_meta = try formatMeta(gpa, .{
+        .name = parsed_meta.name orelse name,
+        .created_at = parsed_meta.created_at orelse now_iso,
+        .status = "active",
+        .ended_at = null,
+    });
+    defer gpa.free(updated_meta);
+    try s.writeMeta(name, updated_meta);
+
+    const log_line = try std.fmt.allocPrint(
+        gpa,
+        "[{s}] session resumed: {s}\n",
+        .{ now_iso, name },
+    );
+    defer gpa.free(log_line);
+    try s.appendLog(name, log_line);
+    try s.setCurrent(name);
+}
+
+fn removeAt(
+    gpa: std.mem.Allocator,
+    options: SessionOptions,
+    name: []const u8,
+    io: std.Io,
+) !void {
+    try validateSessionName(name);
+
+    const s = store.SessionStore.init(gpa, io, options);
+    try s.ensureBaseDirs();
+
+    if (try s.currentSessionName()) |current| {
+        defer gpa.free(current);
+        if (std.mem.eql(u8, current, name)) return error.SessionAlreadyActive;
+    }
+
+    if (!try s.sessionExists(name)) {
+        return error.SessionNotFound;
+    }
+
+    try s.deleteSession(name);
 }
 
 fn todoDoneAt(
@@ -620,6 +751,53 @@ fn currentStatusAt(
     };
 }
 
+fn listSessionsAt(
+    gpa: std.mem.Allocator,
+    options: SessionOptions,
+    io: std.Io,
+) ![]SessionSummary {
+    const s = store.SessionStore.init(gpa, io, options);
+    const names = try s.listSessionNames();
+    defer {
+        for (names) |name| gpa.free(name);
+        gpa.free(names);
+    }
+
+    const current = try s.currentSessionName();
+    defer if (current) |value| gpa.free(value);
+
+    std.mem.sortUnstable([]u8, names, {}, struct {
+        fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+
+    var summaries: std.ArrayList(SessionSummary) = .empty;
+    errdefer {
+        for (summaries.items) |summary| summary.deinit(gpa);
+        summaries.deinit(gpa);
+    }
+
+    for (names) |name| {
+        const meta_text = s.readMeta(name) catch |err| switch (err) {
+            error.FileNotFound => try std.fmt.allocPrint(gpa, "name: {s}\nstatus: unknown\n", .{name}),
+            else => return err,
+        };
+        defer gpa.free(meta_text);
+
+        const meta = try parseMeta(meta_text);
+        try summaries.append(gpa, .{
+            .name = try gpa.dupe(u8, meta.name orelse name),
+            .created_at = try gpa.dupe(u8, meta.created_at orelse "unknown"),
+            .status = try gpa.dupe(u8, meta.status orelse "unknown"),
+            .ended_at = if (meta.ended_at) |ended_at| try gpa.dupe(u8, ended_at) else null,
+            .is_current = if (current) |value| std.mem.eql(u8, value, name) else false,
+        });
+    }
+
+    return summaries.toOwnedSlice(gpa);
+}
+
 const ParsedMeta = struct {
     name: ?[]const u8 = null,
     created_at: ?[]const u8 = null,
@@ -722,6 +900,78 @@ fn validateSessionName(name: []const u8) !void {
             else => {},
         }
     }
+}
+
+test "resume reactivates an ended session" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const options = try testOptions(gpa, tmp.sub_path[0..]);
+    defer options.deinit(gpa);
+
+    try startAt(gpa, options, "alpha", "2026-03-13T10:00:00Z", std.testing.io);
+    var ended = try endAt(gpa, options, "2026-03-13T11:00:00Z", std.testing.io);
+    defer ended.deinit(gpa);
+
+    try resumeAt(gpa, options, "alpha", "2026-03-13T12:00:00Z", std.testing.io);
+
+    const current = (try currentSessionName(gpa, options, std.testing.io)).?;
+    defer gpa.free(current);
+    try std.testing.expectEqualStrings("alpha", current);
+
+    const status = (try currentStatusAt(gpa, options, "2026-03-13T12:05:00Z", std.testing.io)).?;
+    defer status.deinit(gpa);
+    try std.testing.expectEqualStrings("active", status.state);
+}
+
+test "list sessions includes current and ended sessions" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const options = try testOptions(gpa, tmp.sub_path[0..]);
+    defer options.deinit(gpa);
+
+    try startAt(gpa, options, "beta", "2026-03-13T10:00:00Z", std.testing.io);
+    var beta_ended = try endAt(gpa, options, "2026-03-13T11:00:00Z", std.testing.io);
+    defer beta_ended.deinit(gpa);
+
+    try startAt(gpa, options, "alpha", "2026-03-13T12:00:00Z", std.testing.io);
+
+    const sessions = try listSessionsAt(gpa, options, std.testing.io);
+    defer {
+        for (sessions) |session_summary| session_summary.deinit(gpa);
+        gpa.free(sessions);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), sessions.len);
+    try std.testing.expectEqualStrings("alpha", sessions[0].name);
+    try std.testing.expect(sessions[0].is_current);
+    try std.testing.expectEqualStrings("active", sessions[0].status);
+    try std.testing.expect(sessions[0].ended_at == null);
+
+    try std.testing.expectEqualStrings("beta", sessions[1].name);
+    try std.testing.expect(!sessions[1].is_current);
+    try std.testing.expectEqualStrings("ended", sessions[1].status);
+    try std.testing.expectEqualStrings("2026-03-13T11:00:00Z", sessions[1].ended_at.?);
+}
+
+test "remove deletes an ended session" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const options = try testOptions(gpa, tmp.sub_path[0..]);
+    defer options.deinit(gpa);
+
+    try startAt(gpa, options, "alpha", "2026-03-13T10:00:00Z", std.testing.io);
+    var ended = try endAt(gpa, options, "2026-03-13T11:00:00Z", std.testing.io);
+    defer ended.deinit(gpa);
+
+    try removeAt(gpa, options, "alpha", std.testing.io);
+
+    try std.testing.expect(!(try store.SessionStore.init(gpa, std.testing.io, options).sessionExists("alpha")));
 }
 
 test "status includes elapsed values and todo completion timing" {

@@ -67,6 +67,31 @@ pub const SessionStore = struct {
         }
     }
 
+    pub fn listSessionNames(self: SessionStore) ![][]u8 {
+        const sessions_dir_path = try self.sessionsDirPath();
+        defer self.gpa.free(sessions_dir_path);
+
+        var dir = std.Io.Dir.cwd().openDir(self.io, sessions_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return self.gpa.alloc([]u8, 0),
+            else => return err,
+        };
+        defer dir.close(self.io);
+
+        var names: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (names.items) |name| self.gpa.free(name);
+            names.deinit(self.gpa);
+        }
+
+        var it = dir.iterate();
+        while (try it.next(self.io)) |entry| {
+            if (entry.kind != .directory) continue;
+            try names.append(self.gpa, try self.gpa.dupe(u8, entry.name));
+        }
+
+        return names.toOwnedSlice(self.gpa);
+    }
+
     pub fn createSession(
         self: SessionStore,
         name: []const u8,
@@ -105,6 +130,13 @@ pub const SessionStore = struct {
             error.FileNotFound => return error.NoActiveSession,
             else => return err,
         };
+    }
+
+    pub fn deleteSession(self: SessionStore, name: []const u8) !void {
+        const session_dir = try self.sessionDirPath(name);
+        defer self.gpa.free(session_dir);
+
+        try std.Io.Dir.cwd().deleteTree(self.io, session_dir);
     }
 
     pub fn readMeta(self: SessionStore, name: []const u8) ![]u8 {

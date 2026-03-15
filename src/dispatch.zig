@@ -2,6 +2,12 @@ const parse = @import("parse.zig");
 const std = @import("std");
 const session = @import("session.zig");
 
+const SessionConflictAction = enum {
+    start,
+    @"resume",
+    remove,
+};
+
 pub fn dispatch(
     gpa: std.mem.Allocator,
     cmd: parse.CommandData,
@@ -14,21 +20,9 @@ pub fn dispatch(
 
     switch (cmd) {
         .start => |c| {
-            session.start(gpa, options, c.name, io) catch |err| switch (err) {
+            handleStartOrResume(gpa, w, options, io, .start, c.name) catch |err| switch (err) {
                 error.InvalidSessionName => {
                     try w.writeAll("error: invalid session name\n");
-                    try w.flush();
-                    return;
-                },
-                error.SessionAlreadyActive => {
-                    const current = try session.currentSessionName(gpa, options, io);
-                    defer if (current) |name| gpa.free(name);
-
-                    if (current) |name| {
-                        try w.print("error: a session is already active: {s}\n", .{name});
-                    } else {
-                        try w.writeAll("error: a session is already active\n");
-                    }
                     try w.flush();
                     return;
                 },
@@ -37,10 +31,66 @@ pub fn dispatch(
                     try w.flush();
                     return;
                 },
+                error.Cancelled => {
+                    try w.writeAll("cancelled\n");
+                    try w.flush();
+                    return;
+                },
                 else => return err,
             };
 
             try w.print("started session: {s}\n", .{c.name});
+        },
+
+        .@"resume" => |c| {
+            handleStartOrResume(gpa, w, options, io, .@"resume", c.name) catch |err| switch (err) {
+                error.InvalidSessionName => {
+                    try w.writeAll("error: invalid session name\n");
+                    try w.flush();
+                    return;
+                },
+                error.SessionNotFound => {
+                    try w.print("error: session not found: {s}\n", .{c.name});
+                    try w.flush();
+                    return;
+                },
+                error.AlreadyCurrentSession => {
+                    try w.print("session already active: {s}\n", .{c.name});
+                    try w.flush();
+                    return;
+                },
+                error.Cancelled => {
+                    try w.writeAll("cancelled\n");
+                    try w.flush();
+                    return;
+                },
+                else => return err,
+            };
+
+            try w.print("resumed session: {s}\n", .{c.name});
+        },
+
+        .remove => |c| {
+            handleRemove(gpa, w, options, io, c.name) catch |err| switch (err) {
+                error.InvalidSessionName => {
+                    try w.writeAll("error: invalid session name\n");
+                    try w.flush();
+                    return;
+                },
+                error.SessionNotFound => {
+                    try w.print("error: session not found: {s}\n", .{c.name});
+                    try w.flush();
+                    return;
+                },
+                error.Cancelled => {
+                    try w.writeAll("cancelled\n");
+                    try w.flush();
+                    return;
+                },
+                else => return err,
+            };
+
+            try w.print("removed session: {s}\n", .{c.name});
         },
 
         .todo_add => |c| {
@@ -212,6 +262,35 @@ pub fn dispatch(
             }
         },
 
+        .list => {
+            const sessions = try session.listSessions(gpa, options, io);
+            defer {
+                for (sessions) |summary| summary.deinit(gpa);
+                gpa.free(sessions);
+            }
+
+            if (sessions.len == 0) {
+                try w.writeAll("no saved sessions\n");
+                try w.flush();
+                return;
+            }
+
+            for (sessions) |summary| {
+                try w.print(
+                    "{s}{s}\n  created_at: {s}\n  status: {s}\n",
+                    .{
+                        summary.name,
+                        if (summary.is_current) " (current)" else "",
+                        summary.created_at,
+                        summary.status,
+                    },
+                );
+                if (summary.ended_at) |ended_at| {
+                    try w.print("  ended_at: {s}\n", .{ended_at});
+                }
+            }
+        },
+
         .status => {
             const s = try session.currentStatus(gpa, options, io);
             defer if (s) |status| status.deinit(gpa);
@@ -256,4 +335,126 @@ pub fn dispatch(
         },
     }
     try w.flush();
+}
+
+fn handleStartOrResume(
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    options: session.SessionOptions,
+    io: std.Io,
+    action: SessionConflictAction,
+    name: []const u8,
+) !void {
+    while (true) {
+        const completed = switch (action) {
+            .start => blk: {
+                session.start(gpa, options, name, io) catch |err| switch (err) {
+                    error.SessionAlreadyActive => break :blk false,
+                    else => return err,
+                };
+                break :blk true;
+            },
+            .@"resume" => blk: {
+                session.resumeSession(gpa, options, name, io) catch |err| switch (err) {
+                    error.SessionAlreadyActive => break :blk false,
+                    else => return err,
+                };
+                break :blk true;
+            },
+            .remove => unreachable,
+        };
+
+        if (completed) return;
+
+        const current = try session.currentSessionName(gpa, options, io);
+        defer if (current) |value| gpa.free(value);
+
+        const current_name = current orelse return error.SessionAlreadyActive;
+        const confirmed = try confirmReplaceActiveSession(w, io, current_name, action, name);
+        if (!confirmed) return error.Cancelled;
+
+        const ended = try session.end(gpa, options, io);
+        ended.deinit(gpa);
+    }
+}
+
+fn confirmReplaceActiveSession(
+    w: *std.Io.Writer,
+    io: std.Io,
+    current_name: []const u8,
+    action: SessionConflictAction,
+    target_name: []const u8,
+) !bool {
+    try w.print(
+        "session '{s}' is active. End it and {s} '{s}'? [y/n]: ",
+        .{
+            current_name,
+            switch (action) {
+                .start => "start",
+                .@"resume" => "resume",
+                .remove => "remove",
+            },
+            target_name,
+        },
+    );
+    try w.flush();
+
+    var stdin_buffer: [64]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+
+    while (true) {
+        const line = stdin_reader.interface.takeDelimiter('\n') catch |err| switch (err) {
+            error.ReadFailed => return stdin_reader.err.?,
+            error.StreamTooLong => {
+                try w.writeAll("\nPlease answer yes or no: ");
+                try w.flush();
+                continue;
+            },
+        } orelse return false;
+
+        if (parseConfirmation(line)) |confirmed| {
+            return confirmed;
+        }
+
+        try w.writeAll("Please answer yes or no: ");
+        try w.flush();
+    }
+}
+
+fn parseConfirmation(line: []const u8) ?bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(trimmed, "y") or std.ascii.eqlIgnoreCase(trimmed, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "n") or std.ascii.eqlIgnoreCase(trimmed, "no")) return false;
+    return null;
+}
+
+fn handleRemove(
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    options: session.SessionOptions,
+    io: std.Io,
+    name: []const u8,
+) !void {
+    while (true) {
+        session.removeSession(gpa, options, name, io) catch |err| switch (err) {
+            error.SessionAlreadyActive => {},
+            else => return err,
+        };
+
+        const confirmed = try confirmReplaceActiveSession(w, io, name, .remove, name);
+        if (!confirmed) return error.Cancelled;
+
+        const ended = try session.end(gpa, options, io);
+        ended.deinit(gpa);
+    }
+}
+
+test "parse confirmation accepts yes and no" {
+    try std.testing.expectEqual(@as(?bool, true), parseConfirmation("yes\n"));
+    try std.testing.expectEqual(@as(?bool, true), parseConfirmation(" Y "));
+    try std.testing.expectEqual(@as(?bool, false), parseConfirmation("no"));
+    try std.testing.expectEqual(@as(?bool, false), parseConfirmation(" n\t"));
+    try std.testing.expectEqual(@as(?bool, null), parseConfirmation(""));
+    try std.testing.expectEqual(@as(?bool, null), parseConfirmation("maybe"));
 }

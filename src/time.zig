@@ -127,5 +127,5 @@ test "formats human duration" {
 }
 
 test "parses iso8601 timestamp" {
-    try std.testing.expectEqual(@as(i64, 1_710_324_123), try parseIso8601Utc("2024-03-12T11:22:03Z"));
+    try std.testing.expectEqual(@as(i64, 1_710_242_523), try parseIso8601Utc("2024-03-12T11:22:03Z"));
 }

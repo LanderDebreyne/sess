@@ -2,18 +2,27 @@ const std = @import("std");
 
 const CommandKind = enum {
     start,
+    @"resume",
+    remove,
     todo_add,
     todo_done,
     todo_delete,
     todo_undo,
     notes,
     open,
+    list,
     status,
     end,
 };
 
 pub const CommandData = union(CommandKind) {
     start: struct {
+        name: []const u8,
+    },
+    @"resume": struct {
+        name: []const u8,
+    },
+    remove: struct {
         name: []const u8,
     },
     todo_add: struct {
@@ -34,6 +43,7 @@ pub const CommandData = union(CommandKind) {
     open: struct {
         target: OpenTarget,
     },
+    list: void,
     status: void,
     end: void,
 };
@@ -56,9 +66,12 @@ const Command = struct {
 
 pub const commands = [_]Command{
     .{ .name = "start", .usage = "sess start <name>", .help = "start a session" },
+    .{ .name = "resume", .usage = "sess resume <name>", .help = "resume an existing session" },
+    .{ .name = "remove", .usage = "sess remove <name>", .help = "remove an existing session" },
     .{ .name = "todo", .usage = "sess todo add <description>", .help = "manage todos" },
     .{ .name = "notes", .usage = "sess notes <text>", .help = "append to session notes" },
     .{ .name = "open", .usage = "sess open [notes|todo]", .help = "open notes or todos in editor" },
+    .{ .name = "list", .usage = "sess list", .help = "list saved sessions" },
     .{ .name = "status", .usage = "sess status", .help = "show session status" },
     .{ .name = "end", .usage = "sess end", .help = "end the current session" },
 };
@@ -206,6 +219,18 @@ pub fn parseArgs(
         return parsed;
     }
 
+    if (std.mem.eql(u8, first, "resume")) {
+        const name = try takeRestJoined(gpa, &cur, failure, "session name");
+        parsed.command = .{ .@"resume" = .{ .name = name } };
+        return parsed;
+    }
+
+    if (std.mem.eql(u8, first, "remove")) {
+        const name = try takeRestJoined(gpa, &cur, failure, "session name");
+        parsed.command = .{ .remove = .{ .name = name } };
+        return parsed;
+    }
+
     if (std.mem.eql(u8, first, "todo")) {
         const sub = try requireNext(gpa, &cur, failure, "todo subcommand ('add', 'done', 'delete', or 'undo')");
 
@@ -270,6 +295,12 @@ pub fn parseArgs(
         return parsed;
     }
 
+    if (std.mem.eql(u8, first, "list")) {
+        try requireNoMore(gpa, &cur, failure);
+        parsed.command = .{ .list = {} };
+        return parsed;
+    }
+
     if (std.mem.eql(u8, first, "status")) {
         try requireNoMore(gpa, &cur, failure);
         parsed.command = .{ .status = {} };
@@ -302,11 +333,38 @@ test "parses start command by consuming the remaining input" {
     const args = [_][]const u8{ "sess", "start", "weekly", "planning", "sync" };
 
     const parsed = try parseArgs(gpa, &args, &failure);
+    defer gpa.free(parsed.command.?.start.name);
     try std.testing.expect(!parsed.show_help);
     try std.testing.expect(parsed.command != null);
     try std.testing.expectEqualStrings(
         "weekly planning sync",
         parsed.command.?.start.name,
+    );
+}
+
+test "parses resume command by consuming the remaining input" {
+    const gpa = std.testing.allocator;
+    var failure: ?ParseFailure = null;
+    const args = [_][]const u8{ "sess", "resume", "weekly", "planning", "sync" };
+
+    const parsed = try parseArgs(gpa, &args, &failure);
+    defer gpa.free(parsed.command.?.@"resume".name);
+    try std.testing.expectEqualStrings(
+        "weekly planning sync",
+        parsed.command.?.@"resume".name,
+    );
+}
+
+test "parses remove command by consuming the remaining input" {
+    const gpa = std.testing.allocator;
+    var failure: ?ParseFailure = null;
+    const args = [_][]const u8{ "sess", "remove", "weekly", "planning", "sync" };
+
+    const parsed = try parseArgs(gpa, &args, &failure);
+    defer gpa.free(parsed.command.?.remove.name);
+    try std.testing.expectEqualStrings(
+        "weekly planning sync",
+        parsed.command.?.remove.name,
     );
 }
 
@@ -316,6 +374,7 @@ test "rejects extra arguments for status" {
     const args = [_][]const u8{ "sess", "status", "extra" };
 
     try std.testing.expectError(error.InvalidArguments, parseArgs(gpa, &args, &failure));
+    defer if (failure) |f| gpa.free(f.message);
     try std.testing.expect(failure != null);
 }
 
@@ -325,6 +384,7 @@ test "parses notes command by consuming the remaining input" {
     const args = [_][]const u8{ "sess", "notes", "investigate", "api", "drift" };
 
     const parsed = try parseArgs(gpa, &args, &failure);
+    defer gpa.free(parsed.command.?.notes.content);
     try std.testing.expectEqualStrings("investigate api drift", parsed.command.?.notes.content);
 }
 
@@ -335,6 +395,19 @@ test "parses open command defaulting to notes" {
 
     const parsed = try parseArgs(gpa, &args, &failure);
     try std.testing.expectEqual(OpenTarget.notes, parsed.command.?.open.target);
+}
+
+test "parses list command" {
+    const gpa = std.testing.allocator;
+    var failure: ?ParseFailure = null;
+    const args = [_][]const u8{ "sess", "list" };
+
+    const parsed = try parseArgs(gpa, &args, &failure);
+    try std.testing.expect(parsed.command != null);
+    switch (parsed.command.?) {
+        .list => {},
+        else => try std.testing.expect(false),
+    }
 }
 
 test "parses todo delete and undo commands" {
