@@ -28,9 +28,7 @@ const OverlayTodo = struct {
     index: usize,
     state: []const u8,
     description: []const u8,
-    done_at: ?[]const u8 = null,
     elapsed: ?[]const u8 = null,
-    done_in: ?[]const u8 = null,
 };
 
 const OverlayState = struct {
@@ -61,9 +59,7 @@ fn deinitState(gpa: std.mem.Allocator, state: OverlayState) void {
 
     for (state.todos) |item| {
         gpa.free(item.description);
-        if (item.done_at) |value| gpa.free(value);
         if (item.elapsed) |value| gpa.free(value);
-        if (item.done_in) |value| gpa.free(value);
     }
     if (state.todos.len != 0) gpa.free(state.todos);
 }
@@ -313,7 +309,7 @@ fn buildOpenTodos(gpa: std.mem.Allocator, items: []const todo.Item) ![]OpenTodo 
     defer out.deinit(gpa);
 
     for (items, 0..) |item, index| {
-        if (item.state != .open) continue;
+        if (item.state == .done) continue;
         try out.append(gpa, .{
             .index = index + 1,
             .description = try gpa.dupe(u8, item.description),
@@ -342,68 +338,29 @@ fn buildTodos(gpa: std.mem.Allocator, items: []const todo.Item) ![]OverlayTodo {
                 .state = "open",
                 .description = try gpa.dupe(u8, item.description),
             }),
+            .in_progress => try out.append(gpa, .{
+                .index = index + 1,
+                .state = "in progress",
+                .description = try gpa.dupe(u8, item.description),
+            }),
             .done => {
-                const done_at = if (item.done_at) |value|
-                    time.formatIso8601UtcLocal(gpa, value) catch try gpa.dupe(u8, value)
-                else
-                    null;
-                errdefer if (done_at) |value| gpa.free(value);
-
                 const elapsed = if (item.elapsed_seconds) |seconds|
                     try time.formatDurationHuman(gpa, seconds)
                 else
                     null;
                 errdefer if (elapsed) |value| gpa.free(value);
 
-                const done_in = if (item.done_at) |value|
-                    try formatElapsedSincePreviousDone(gpa, items, value, item.elapsed_seconds)
-                else
-                    null;
-                errdefer if (done_in) |value| gpa.free(value);
-
                 try out.append(gpa, .{
                     .index = index + 1,
                     .state = "done",
                     .description = try gpa.dupe(u8, item.description),
-                    .done_at = done_at,
                     .elapsed = elapsed,
-                    .done_in = done_in,
                 });
             },
         }
     }
 
     return out.toOwnedSlice(gpa);
-}
-
-fn formatElapsedSincePreviousDone(
-    gpa: std.mem.Allocator,
-    items: []const todo.Item,
-    done_at: []const u8,
-    elapsed_since_start_seconds: ?u64,
-) ![]u8 {
-    const current_done_seconds = time.parseIso8601Utc(done_at) catch return gpa.dupe(u8, "unknown");
-
-    var previous_done_seconds: ?i64 = null;
-    for (items) |item| {
-        const previous_done_at = item.done_at orelse continue;
-        if (std.mem.eql(u8, previous_done_at, done_at)) continue;
-
-        const parsed = time.parseIso8601Utc(previous_done_at) catch continue;
-        if (parsed >= current_done_seconds) continue;
-
-        previous_done_seconds = if (previous_done_seconds) |current|
-            @max(current, parsed)
-        else
-            parsed;
-    }
-
-    const elapsed = if (previous_done_seconds) |previous|
-        @as(u64, @intCast(current_done_seconds - previous))
-    else
-        elapsed_since_start_seconds orelse 0;
-
-    return time.formatDurationHuman(gpa, elapsed);
 }
 
 fn appendWarning(
@@ -432,9 +389,7 @@ test "builds overlay todos from todo items" {
     defer {
         for (todos) |item| {
             gpa.free(item.description);
-            if (item.done_at) |value| gpa.free(value);
             if (item.elapsed) |value| gpa.free(value);
-            if (item.done_in) |value| gpa.free(value);
         }
         gpa.free(todos);
     }
@@ -444,9 +399,7 @@ test "builds overlay todos from todo items" {
     try std.testing.expectEqualStrings("keep overlay scroll stable", todos[0].description);
     try std.testing.expectEqualStrings("done", todos[1].state);
     try std.testing.expectEqualStrings("replace todo timeline", todos[1].description);
-    try std.testing.expect(todos[1].done_at != null);
     try std.testing.expectEqualStrings("2m 0s", todos[1].elapsed.?);
-    try std.testing.expectEqualStrings("2m 0s", todos[1].done_in.?);
 }
 
 test "buildState returns empty payload without active session" {

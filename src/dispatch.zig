@@ -118,6 +118,34 @@ pub fn dispatch(
             try w.print("added todo: {s}\n", .{c.description});
         },
 
+        .todo_insert => |c| {
+            session.todoInsert(gpa, options, c.index, c.description, io) catch |err| switch (err) {
+                error.NoActiveSession => {
+                    try w.writeAll("error: no active session\n");
+                    try w.flush();
+                    return;
+                },
+                error.EmptyTodoDescription => {
+                    try w.writeAll("error: todo description cannot be empty\n");
+                    try w.flush();
+                    return;
+                },
+                error.InvalidTodoIndex => {
+                    try w.print("error: invalid todo index: {}\n", .{c.index});
+                    try w.flush();
+                    return;
+                },
+                error.CorruptSessionState => {
+                    try w.writeAll("error: active session state is corrupt\n");
+                    try w.flush();
+                    return;
+                },
+                else => return err,
+            };
+
+            try w.print("inserted todo {}: {s}\n", .{ c.index, c.description });
+        },
+
         .todo_done => |c| {
             var result = session.todoDone(gpa, options, c.index, io) catch |err| switch (err) {
                 error.NoActiveSession => {
@@ -145,8 +173,8 @@ pub fn dispatch(
             defer result.deinit(gpa);
 
             try w.print(
-                "completed todo {} at {s}, done in {s}: {s}\n",
-                .{ c.index, result.elapsed_since_start, result.elapsed_since_last_done, result.description },
+                "completed todo {} at {s}: {s}\n",
+                .{ c.index, result.elapsed_since_start, result.description },
             );
         },
 
@@ -201,6 +229,64 @@ pub fn dispatch(
             defer result.deinit(gpa);
 
             try w.print("reopened todo {}: {s}\n", .{ c.index, result.description });
+        },
+
+        .todo_move => |c| {
+            var result = session.todoMove(gpa, options, c.from_index, c.to_index, io) catch |err| switch (err) {
+                error.NoActiveSession => {
+                    try w.writeAll("error: no active session\n");
+                    try w.flush();
+                    return;
+                },
+                error.InvalidTodoIndex => {
+                    try w.print("error: invalid todo index: {} -> {}\n", .{ c.from_index, c.to_index });
+                    try w.flush();
+                    return;
+                },
+                error.CorruptSessionState => {
+                    try w.writeAll("error: active session state is corrupt\n");
+                    try w.flush();
+                    return;
+                },
+                else => return err,
+            };
+            defer result.deinit(gpa);
+
+            try w.print("moved todo {} to {}: {s}\n", .{ c.from_index, c.to_index, result.description });
+        },
+
+        .todo_progress => |c| {
+            var result = session.todoProgress(gpa, options, c.index, io) catch |err| switch (err) {
+                error.NoActiveSession => {
+                    try w.writeAll("error: no active session\n");
+                    try w.flush();
+                    return;
+                },
+                error.InvalidTodoIndex => {
+                    try w.print("error: invalid todo index: {}\n", .{c.index});
+                    try w.flush();
+                    return;
+                },
+                error.TodoAlreadyDone => {
+                    try w.print("error: todo already completed: {}\n", .{c.index});
+                    try w.flush();
+                    return;
+                },
+                error.TodoAlreadyInProgress => {
+                    try w.print("error: todo already in progress: {}\n", .{c.index});
+                    try w.flush();
+                    return;
+                },
+                error.CorruptSessionState => {
+                    try w.writeAll("error: active session state is corrupt\n");
+                    try w.flush();
+                    return;
+                },
+                else => return err,
+            };
+            defer result.deinit(gpa);
+
+            try w.print("marked todo {} in progress: {s}\n", .{ c.index, result.description });
         },
 
         .notes => |c| {

@@ -257,6 +257,9 @@
     .todo-state.is-open {
       color: var(--accent);
     }
+    .todo-state.is-progress {
+      color: #f6c667;
+    }
     .todo-state.is-done {
       color: var(--accent-strong);
     }
@@ -428,10 +431,8 @@
           <div class="todo-index">#${todo.index}</div>
           <div class="todo-body">
             <div class="todo-meta">
-              <div class="todo-state ${todo.state === "done" ? "is-done" : "is-open"}">${escapeHtml(todo.state)}</div>
-              ${todo.done_at ? `<div class="todo-detail">done ${escapeHtml(todo.done_at)}</div>` : ""}
+              <div class="todo-state ${todo.state === "done" ? "is-done" : todo.state === "in progress" ? "is-progress" : "is-open"}">${escapeHtml(todo.state)}</div>
               ${todo.elapsed ? `<div class="todo-detail">at ${escapeHtml(todo.elapsed)}</div>` : ""}
-              ${todo.done_in ? `<div class="todo-detail">in ${escapeHtml(todo.done_in)}</div>` : ""}
             </div>
             <div class="todo-text">${escapeHtml(todo.description)}</div>
           </div>

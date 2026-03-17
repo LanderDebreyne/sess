@@ -3,6 +3,7 @@ const time = @import("time.zig");
 
 pub const State = enum {
     open,
+    in_progress,
     done,
 };
 
@@ -15,6 +16,13 @@ pub const Item = struct {
     pub fn open(gpa: std.mem.Allocator, description: []const u8) !Item {
         return .{
             .state = .open,
+            .description = try gpa.dupe(u8, description),
+        };
+    }
+
+    pub fn inProgress(gpa: std.mem.Allocator, description: []const u8) !Item {
+        return .{
+            .state = .in_progress,
             .description = try gpa.dupe(u8, description),
         };
     }
@@ -54,6 +62,11 @@ pub fn formatList(gpa: std.mem.Allocator, items: []const Item) ![]u8 {
                 defer gpa.free(line);
                 try out.appendSlice(gpa, line);
             },
+            .in_progress => {
+                const line = try std.fmt.allocPrint(gpa, "progress\t{s}\n", .{item.description});
+                defer gpa.free(line);
+                try out.appendSlice(gpa, line);
+            },
             .done => {
                 const line = try std.fmt.allocPrint(
                     gpa,
@@ -86,21 +99,21 @@ pub fn renderList(gpa: std.mem.Allocator, items: []const Item) ![]u8 {
                 defer gpa.free(line);
                 try out.appendSlice(gpa, line);
             },
+            .in_progress => {
+                const line = try std.fmt.allocPrint(gpa, "  {d}. [-] {s}\n", .{ i + 1, item.description });
+                defer gpa.free(line);
+                try out.appendSlice(gpa, line);
+            },
             .done => {
                 const elapsed_since_start = if (item.elapsed_seconds) |seconds|
                     try time.formatDurationHuman(gpa, seconds)
                 else
                     try gpa.dupe(u8, "unknown");
                 defer gpa.free(elapsed_since_start);
-                const elapsed_since_last_done = if (item.done_at) |done_at|
-                    try formatElapsedSincePreviousDone(gpa, items, done_at, item.elapsed_seconds)
-                else
-                    try gpa.dupe(u8, "unknown");
-                defer gpa.free(elapsed_since_last_done);
                 const line = try std.fmt.allocPrint(
                     gpa,
-                    "  {d}. [x] {s} ({s}: done in {s})\n",
-                    .{ i + 1, item.description, elapsed_since_start, elapsed_since_last_done },
+                    "  {d}. [x] {s} ({s})\n",
+                    .{ i + 1, item.description, elapsed_since_start },
                 );
                 defer gpa.free(line);
                 try out.appendSlice(gpa, line);
@@ -131,8 +144,16 @@ fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Item {
         };
     }
 
+    if (std.mem.startsWith(u8, line, "progress\t")) {
+        return Item.inProgress(gpa, line["progress\t".len..]);
+    }
+
     if (std.mem.startsWith(u8, line, "- [ ] ")) {
         return Item.open(gpa, line["- [ ] ".len..]);
+    }
+
+    if (std.mem.startsWith(u8, line, "- [-] ")) {
+        return Item.inProgress(gpa, line["- [-] ".len..]);
     }
 
     if (std.mem.startsWith(u8, line, "- [x] ")) {
@@ -144,52 +165,23 @@ fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Item {
 
     return error.InvalidTodoFormat;
 }
-
-fn formatElapsedSincePreviousDone(
-    gpa: std.mem.Allocator,
-    items: []const Item,
-    done_at: []const u8,
-    elapsed_since_start_seconds: ?u64,
-) ![]u8 {
-    const current_done_seconds = time.parseIso8601Utc(done_at) catch return gpa.dupe(u8, "unknown");
-
-    var previous_done_seconds: ?i64 = null;
-    for (items) |item| {
-        const previous_done_at = item.done_at orelse continue;
-        if (std.mem.eql(u8, previous_done_at, done_at)) continue;
-
-        const parsed = time.parseIso8601Utc(previous_done_at) catch continue;
-        if (parsed >= current_done_seconds) continue;
-
-        previous_done_seconds = if (previous_done_seconds) |current|
-            @max(current, parsed)
-        else
-            parsed;
-    }
-
-    const elapsed = if (previous_done_seconds) |previous|
-        @as(u64, @intCast(current_done_seconds - previous))
-    else
-        elapsed_since_start_seconds orelse 0;
-
-    return time.formatDurationHuman(gpa, elapsed);
-}
-
 test "parses legacy and structured todo files" {
     const gpa = std.testing.allocator;
     const contents = "- [ ] first\n" ++
         "done\tsecond\t2026-03-13T11:00:00Z\t3600\n" ++
-        "- [x] third\n";
+        "- [x] third\n" ++
+        "progress\tfourth\n";
 
     const items = try parseList(gpa, contents);
     defer freeList(gpa, items);
 
-    try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expectEqual(@as(usize, 4), items.len);
     try std.testing.expectEqual(State.open, items[0].state);
     try std.testing.expectEqual(State.done, items[1].state);
     try std.testing.expectEqualStrings("2026-03-13T11:00:00Z", items[1].done_at.?);
     try std.testing.expectEqual(@as(?u64, 3600), items[1].elapsed_seconds);
     try std.testing.expectEqual(State.done, items[2].state);
+    try std.testing.expectEqual(State.in_progress, items[3].state);
 }
 
 test "renders completion elapsed time" {
@@ -208,8 +200,5 @@ test "renders completion elapsed time" {
     const rendered = try renderList(gpa, items);
     defer gpa.free(rendered);
 
-    try std.testing.expectEqualStrings(
-        "  1. [ ] first\n  2. [x] second (1h 1m 1s: done in 1h 1m 1s)\n",
-        rendered,
-    );
+    try std.testing.expectEqualStrings("  1. [ ] first\n  2. [x] second (1h 1m 1s)\n", rendered);
 }

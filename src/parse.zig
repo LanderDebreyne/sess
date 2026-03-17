@@ -5,9 +5,12 @@ const CommandKind = enum {
     @"resume",
     remove,
     todo_add,
+    todo_insert,
     todo_done,
     todo_delete,
     todo_undo,
+    todo_move,
+    todo_progress,
     notes,
     open,
     list,
@@ -36,6 +39,10 @@ pub const CommandData = union(CommandKind) {
     todo_add: struct {
         description: []const u8,
     },
+    todo_insert: struct {
+        index: usize,
+        description: []const u8,
+    },
     todo_done: struct {
         index: usize,
     },
@@ -43,6 +50,13 @@ pub const CommandData = union(CommandKind) {
         index: usize,
     },
     todo_undo: struct {
+        index: usize,
+    },
+    todo_move: struct {
+        from_index: usize,
+        to_index: usize,
+    },
+    todo_progress: struct {
         index: usize,
     },
     notes: struct {
@@ -253,7 +267,7 @@ pub fn parseArgs(
     }
 
     if (std.mem.eql(u8, first, "todo")) {
-        const sub = try requireNext(gpa, &cur, failure, "todo subcommand ('add', 'done', 'delete', or 'undo')");
+        const sub = try requireNext(gpa, &cur, failure, "todo subcommand ('add', 'insert', 'done', 'delete', 'undo', 'unmark', 'move', or 'progress')");
 
         if (std.mem.eql(u8, sub, "add")) {
             const desc = try takeRestJoined(
@@ -263,6 +277,14 @@ pub fn parseArgs(
                 "todo description",
             );
             parsed.command = .{ .todo_add = .{ .description = desc } };
+            return parsed;
+        }
+
+        if (std.mem.eql(u8, sub, "insert")) {
+            const raw_index = try requireNext(gpa, &cur, failure, "todo index");
+            const index = try parseIndex(gpa, raw_index, failure);
+            const desc = try takeRestJoined(gpa, &cur, failure, "todo description");
+            parsed.command = .{ .todo_insert = .{ .index = index, .description = desc } };
             return parsed;
         }
 
@@ -282,7 +304,7 @@ pub fn parseArgs(
             return parsed;
         }
 
-        if (std.mem.eql(u8, sub, "undo")) {
+        if (std.mem.eql(u8, sub, "undo") or std.mem.eql(u8, sub, "unmark")) {
             const raw_index = try requireNext(gpa, &cur, failure, "todo index");
             const index = try parseIndex(gpa, raw_index, failure);
             try requireNoMore(gpa, &cur, failure);
@@ -290,10 +312,28 @@ pub fn parseArgs(
             return parsed;
         }
 
+        if (std.mem.eql(u8, sub, "move")) {
+            const raw_from_index = try requireNext(gpa, &cur, failure, "source todo index");
+            const from_index = try parseIndex(gpa, raw_from_index, failure);
+            const raw_to_index = try requireNext(gpa, &cur, failure, "destination todo index");
+            const to_index = try parseIndex(gpa, raw_to_index, failure);
+            try requireNoMore(gpa, &cur, failure);
+            parsed.command = .{ .todo_move = .{ .from_index = from_index, .to_index = to_index } };
+            return parsed;
+        }
+
+        if (std.mem.eql(u8, sub, "progress")) {
+            const raw_index = try requireNext(gpa, &cur, failure, "todo index");
+            const index = try parseIndex(gpa, raw_index, failure);
+            try requireNoMore(gpa, &cur, failure);
+            parsed.command = .{ .todo_progress = .{ .index = index } };
+            return parsed;
+        }
+
         return fail(
             gpa,
             failure,
-            "unknown todo subcommand: '{s}' (expected 'add', 'done', 'delete', or 'undo')",
+            "unknown todo subcommand: '{s}' (expected 'add', 'insert', 'done', 'delete', 'undo', 'unmark', 'move', or 'progress')",
             .{sub},
         );
     }
@@ -378,6 +418,23 @@ test "parses todo done command" {
     try std.testing.expect(!parsed.show_help);
     try std.testing.expect(parsed.command != null);
     try std.testing.expectEqual(@as(usize, 3), parsed.command.?.todo_done.index);
+}
+
+test "parses todo insert and move commands" {
+    const gpa = std.testing.allocator;
+    var failure: ?ParseFailure = null;
+
+    const insert_args = [_][]const u8{ "sess", "todo", "insert", "2", "new", "task" };
+    const insert_parsed = try parseArgs(gpa, &insert_args, &failure);
+    defer gpa.free(insert_parsed.command.?.todo_insert.description);
+    try std.testing.expectEqual(@as(usize, 2), insert_parsed.command.?.todo_insert.index);
+    try std.testing.expectEqualStrings("new task", insert_parsed.command.?.todo_insert.description);
+
+    failure = null;
+    const move_args = [_][]const u8{ "sess", "todo", "move", "4", "1" };
+    const move_parsed = try parseArgs(gpa, &move_args, &failure);
+    try std.testing.expectEqual(@as(usize, 4), move_parsed.command.?.todo_move.from_index);
+    try std.testing.expectEqual(@as(usize, 1), move_parsed.command.?.todo_move.to_index);
 }
 
 test "parses start command by consuming the remaining input" {
@@ -475,6 +532,24 @@ test "parses todo delete and undo commands" {
     const undo_args = [_][]const u8{ "sess", "todo", "undo", "4" };
     const undo_parsed = try parseArgs(gpa, &undo_args, &failure);
     try std.testing.expectEqual(@as(usize, 4), undo_parsed.command.?.todo_undo.index);
+}
+
+test "parses todo unmark alias" {
+    const gpa = std.testing.allocator;
+    var failure: ?ParseFailure = null;
+    const args = [_][]const u8{ "sess", "todo", "unmark", "4" };
+
+    const parsed = try parseArgs(gpa, &args, &failure);
+    try std.testing.expectEqual(@as(usize, 4), parsed.command.?.todo_undo.index);
+}
+
+test "parses todo progress command" {
+    const gpa = std.testing.allocator;
+    var failure: ?ParseFailure = null;
+    const args = [_][]const u8{ "sess", "todo", "progress", "5" };
+
+    const parsed = try parseArgs(gpa, &args, &failure);
+    try std.testing.expectEqual(@as(usize, 5), parsed.command.?.todo_progress.index);
 }
 
 test "parses overlay serve with defaults" {

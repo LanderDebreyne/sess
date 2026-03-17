@@ -30,6 +30,7 @@ pub const SessionError = error{
     EmptyNotesContent,
     InvalidTodoIndex,
     TodoAlreadyDone,
+    TodoAlreadyInProgress,
     TodoAlreadyOpen,
     CorruptSessionState,
 };
@@ -59,12 +60,10 @@ pub const SessionSummary = struct {
 pub const TodoDoneResult = struct {
     description: []u8,
     elapsed_since_start: []u8,
-    elapsed_since_last_done: []u8,
 
     pub fn deinit(self: TodoDoneResult, gpa: std.mem.Allocator) void {
         gpa.free(self.description);
         gpa.free(self.elapsed_since_start);
-        gpa.free(self.elapsed_since_last_done);
     }
 };
 
@@ -120,6 +119,22 @@ pub const TodoUndoResult = struct {
     }
 };
 
+pub const TodoMoveResult = struct {
+    description: []u8,
+
+    pub fn deinit(self: TodoMoveResult, gpa: std.mem.Allocator) void {
+        gpa.free(self.description);
+    }
+};
+
+pub const TodoProgressResult = struct {
+    description: []u8,
+
+    pub fn deinit(self: TodoProgressResult, gpa: std.mem.Allocator) void {
+        gpa.free(self.description);
+    }
+};
+
 pub fn start(
     gpa: std.mem.Allocator,
     options: SessionOptions,
@@ -159,6 +174,16 @@ pub fn todoAdd(
     description: []const u8,
     io: std.Io,
 ) !void {
+    try todoInsert(gpa, options, 0, description, io);
+}
+
+pub fn todoInsert(
+    gpa: std.mem.Allocator,
+    options: SessionOptions,
+    index: usize,
+    description: []const u8,
+    io: std.Io,
+) !void {
     const trimmed = std.mem.trim(u8, description, " \t\r\n");
     if (trimmed.len == 0) return error.EmptyTodoDescription;
 
@@ -176,7 +201,7 @@ pub fn todoAdd(
     defer todo.freeList(gpa, items);
 
     const next = try todo.Item.open(gpa, trimmed);
-    items = try appendTodoItem(gpa, items, next);
+    items = try insertTodoItem(gpa, items, index, next);
 
     const updated = try todo.formatList(gpa, items);
     defer gpa.free(updated);
@@ -185,7 +210,10 @@ pub fn todoAdd(
     const now = try time.nowIso8601Utc(gpa, io);
     defer gpa.free(now);
 
-    const log_line = try std.fmt.allocPrint(gpa, "[{s}] todo added: {s}\n", .{ now, trimmed });
+    const log_line = if (index == 0)
+        try std.fmt.allocPrint(gpa, "[{s}] todo added: {s}\n", .{ now, trimmed })
+    else
+        try std.fmt.allocPrint(gpa, "[{s}] todo inserted (#{d}): {s}\n", .{ now, index, trimmed });
     defer gpa.free(log_line);
     try s.appendLog(name, log_line);
 }
@@ -224,6 +252,31 @@ pub fn todoUndo(
     defer gpa.free(now);
 
     return try todoUndoAt(gpa, options, index, now, io);
+}
+
+pub fn todoMove(
+    gpa: std.mem.Allocator,
+    options: SessionOptions,
+    from_index: usize,
+    to_index: usize,
+    io: std.Io,
+) !TodoMoveResult {
+    const now = try time.nowIso8601Utc(gpa, io);
+    defer gpa.free(now);
+
+    return try todoMoveAt(gpa, options, from_index, to_index, now, io);
+}
+
+pub fn todoProgress(
+    gpa: std.mem.Allocator,
+    options: SessionOptions,
+    index: usize,
+    io: std.Io,
+) !TodoProgressResult {
+    const now = try time.nowIso8601Utc(gpa, io);
+    defer gpa.free(now);
+
+    return try todoProgressAt(gpa, options, index, now, io);
 }
 
 pub fn notesAppend(
@@ -443,9 +496,12 @@ fn todoDoneAt(
 
     if (index > items.len) return error.InvalidTodoIndex;
 
-    const previous_done_seconds = latestDoneSeconds(items);
     var item = &items[index - 1];
     if (item.state == .done) return error.TodoAlreadyDone;
+    if (item.done_at) |done_at| {
+        gpa.free(done_at);
+        item.done_at = null;
+    }
 
     item.state = .done;
     item.done_at = try gpa.dupe(u8, now_iso);
@@ -457,20 +513,11 @@ fn todoDoneAt(
 
     const elapsed = try time.formatDurationHuman(gpa, elapsed_seconds);
     errdefer gpa.free(elapsed);
-    const elapsed_since_last_done_seconds = if (previous_done_seconds) |done_seconds|
-        if (now_seconds >= done_seconds)
-            @as(u64, @intCast(now_seconds - done_seconds))
-        else
-            0
-    else
-        elapsed_seconds;
-    const elapsed_since_last_done = try time.formatDurationHuman(gpa, elapsed_since_last_done_seconds);
-    errdefer gpa.free(elapsed_since_last_done);
 
     const log_line = try std.fmt.allocPrint(
         gpa,
-        "[{s}] todo completed (#{d}) at {s}, done in {s}: {s}\n",
-        .{ now_iso, index, elapsed, elapsed_since_last_done, item.description },
+        "[{s}] todo completed (#{d}) at {s}: {s}\n",
+        .{ now_iso, index, elapsed, item.description },
     );
     defer gpa.free(log_line);
     try s.appendLog(name, log_line);
@@ -478,7 +525,6 @@ fn todoDoneAt(
     return .{
         .description = try gpa.dupe(u8, item.description),
         .elapsed_since_start = elapsed,
-        .elapsed_since_last_done = elapsed_since_last_done,
     };
 }
 
@@ -574,6 +620,109 @@ fn todoUndoAt(
     const log_line = try std.fmt.allocPrint(
         gpa,
         "[{s}] todo reopened (#{d}): {s}\n",
+        .{ now_iso, index, item.description },
+    );
+    defer gpa.free(log_line);
+    try s.appendLog(name, log_line);
+
+    return .{ .description = try gpa.dupe(u8, item.description) };
+}
+
+fn todoMoveAt(
+    gpa: std.mem.Allocator,
+    options: SessionOptions,
+    from_index: usize,
+    to_index: usize,
+    now_iso: []const u8,
+    io: std.Io,
+) !TodoMoveResult {
+    if (from_index == 0 or to_index == 0) return error.InvalidTodoIndex;
+
+    const s = store.SessionStore.init(gpa, io, options);
+    const name = try s.currentSessionName() orelse return error.NoActiveSession;
+    defer gpa.free(name);
+
+    const todos_text = s.readTodos(name) catch |err| switch (err) {
+        error.FileNotFound => return error.CorruptSessionState,
+        else => return err,
+    };
+    defer gpa.free(todos_text);
+
+    var items = try todo.parseList(gpa, todos_text);
+    defer todo.freeList(gpa, items);
+
+    if (from_index > items.len or to_index > items.len) return error.InvalidTodoIndex;
+
+    const moved_description = try gpa.dupe(u8, items[from_index - 1].description);
+    errdefer gpa.free(moved_description);
+
+    if (from_index != to_index) {
+        const moved = items[from_index - 1];
+        if (from_index < to_index) {
+            for (from_index..to_index) |i| {
+                items[i - 1] = items[i];
+            }
+        } else {
+            var i = from_index - 1;
+            while (i > to_index - 1) : (i -= 1) {
+                items[i] = items[i - 1];
+            }
+        }
+        items[to_index - 1] = moved;
+    }
+
+    const updated = try todo.formatList(gpa, items);
+    defer gpa.free(updated);
+    try s.writeTodos(name, updated);
+
+    const log_line = try std.fmt.allocPrint(
+        gpa,
+        "[{s}] todo moved (#{d} -> #{d}): {s}\n",
+        .{ now_iso, from_index, to_index, moved_description },
+    );
+    defer gpa.free(log_line);
+    try s.appendLog(name, log_line);
+
+    return .{ .description = moved_description };
+}
+
+fn todoProgressAt(
+    gpa: std.mem.Allocator,
+    options: SessionOptions,
+    index: usize,
+    now_iso: []const u8,
+    io: std.Io,
+) !TodoProgressResult {
+    if (index == 0) return error.InvalidTodoIndex;
+
+    const s = store.SessionStore.init(gpa, io, options);
+    const name = try s.currentSessionName() orelse return error.NoActiveSession;
+    defer gpa.free(name);
+
+    const todos_text = s.readTodos(name) catch |err| switch (err) {
+        error.FileNotFound => return error.CorruptSessionState,
+        else => return err,
+    };
+    defer gpa.free(todos_text);
+
+    var items = try todo.parseList(gpa, todos_text);
+    defer todo.freeList(gpa, items);
+
+    if (index > items.len) return error.InvalidTodoIndex;
+
+    var item = &items[index - 1];
+    if (item.state == .done) return error.TodoAlreadyDone;
+    if (item.state == .in_progress) return error.TodoAlreadyInProgress;
+
+    item.state = .in_progress;
+
+    const updated = try todo.formatList(gpa, items);
+    defer gpa.free(updated);
+    try s.writeTodos(name, updated);
+
+    const log_line = try std.fmt.allocPrint(
+        gpa,
+        "[{s}] todo in progress (#{d}): {s}\n",
         .{ now_iso, index, item.description },
     );
     defer gpa.free(log_line);
@@ -859,14 +1008,22 @@ fn formatMeta(gpa: std.mem.Allocator, meta: SessionMeta) ![]u8 {
     );
 }
 
-fn appendTodoItem(
+fn insertTodoItem(
     gpa: std.mem.Allocator,
     items: []todo.Item,
+    index: usize,
     next: todo.Item,
 ) ![]todo.Item {
+    if (index > items.len + 1) {
+        next.deinit(gpa);
+        return error.InvalidTodoIndex;
+    }
+
+    const insertion_index = if (index == 0) items.len else index - 1;
     var out = try gpa.alloc(todo.Item, items.len + 1);
-    for (items, 0..) |item, i| out[i] = item;
-    out[items.len] = next;
+    for (items[0..insertion_index], 0..) |item, i| out[i] = item;
+    out[insertion_index] = next;
+    for (items[insertion_index..], insertion_index + 1..) |item, i| out[i] = item;
     gpa.free(items);
     return out;
 }
@@ -1018,7 +1175,7 @@ test "remove deletes ended session while another session remains active" {
     try std.testing.expectEqualStrings("beta", current);
 }
 
-test "status includes elapsed values and todo completion timing" {
+test "status includes elapsed values and todo completion point" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1034,7 +1191,6 @@ test "status includes elapsed values and todo completion timing" {
 
     try std.testing.expectEqualStrings("first task", result.description);
     try std.testing.expectEqualStrings("1h 2m 3s", result.elapsed_since_start);
-    try std.testing.expectEqualStrings("1h 2m 3s", result.elapsed_since_last_done);
 
     const status = (try currentStatusAt(gpa, options, "2026-03-14T12:02:04Z", std.testing.io)).?;
     defer status.deinit(gpa);
@@ -1044,11 +1200,11 @@ test "status includes elapsed values and todo completion timing" {
     try std.testing.expectEqualStrings("1d 2h 2m 4s", status.elapsed);
     try std.testing.expect(status.since_last_done != null);
     try std.testing.expectEqualStrings("1d 1h 0m 1s", status.since_last_done.?);
-    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "1. [x] first task (1h 2m 3s: done in 1h 2m 3s)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "1. [x] first task (1h 2m 3s)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, status.notes, 1, "# Notes"));
 }
 
-test "second completed todo shows time since previous completion and session start" {
+test "second completed todo shows completion point from session start" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1066,13 +1222,12 @@ test "second completed todo shows time since previous completion and session sta
     defer second.deinit(gpa);
 
     try std.testing.expectEqualStrings("2m 16s", second.elapsed_since_start);
-    try std.testing.expectEqualStrings("2m 4s", second.elapsed_since_last_done);
 
     const status = (try currentStatusAt(gpa, options, "2026-03-13T10:02:16Z", std.testing.io)).?;
     defer status.deinit(gpa);
 
-    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "1. [x] first task (12s: done in 12s)"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "2. [x] second task (2m 16s: done in 2m 4s)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "1. [x] first task (12s)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "2. [x] second task (2m 16s)"));
 }
 
 test "todo cannot be completed twice" {
@@ -1179,6 +1334,57 @@ test "todo delete removes item and undo reopens completed todo" {
     const status = (try currentStatusAt(gpa, options, "2026-03-13T10:04:00Z", std.testing.io)).?;
     defer status.deinit(gpa);
     try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "1. [ ] second task"));
+}
+
+test "todo insert and move reorder items by index" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const options = try testOptions(gpa, tmp.sub_path[0..]);
+    defer options.deinit(gpa);
+
+    try startAt(gpa, options, "alpha", "2026-03-13T10:00:00Z", std.testing.io);
+    try todoAdd(gpa, options, "first task", std.testing.io);
+    try todoAdd(gpa, options, "third task", std.testing.io);
+    try todoInsert(gpa, options, 2, "second task", std.testing.io);
+
+    var moved = try todoMoveAt(gpa, options, 3, 1, "2026-03-13T10:01:00Z", std.testing.io);
+    defer moved.deinit(gpa);
+    try std.testing.expectEqualStrings("third task", moved.description);
+
+    const status = (try currentStatusAt(gpa, options, "2026-03-13T10:02:00Z", std.testing.io)).?;
+    defer status.deinit(gpa);
+    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "1. [ ] third task"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "2. [ ] first task"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, status.todos, 1, "3. [ ] second task"));
+}
+
+test "todo progress is visible and undo clears it" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const options = try testOptions(gpa, tmp.sub_path[0..]);
+    defer options.deinit(gpa);
+
+    try startAt(gpa, options, "alpha", "2026-03-13T10:00:00Z", std.testing.io);
+    try todoAdd(gpa, options, "first task", std.testing.io);
+
+    var progress = try todoProgressAt(gpa, options, 1, "2026-03-13T10:01:00Z", std.testing.io);
+    defer progress.deinit(gpa);
+    try std.testing.expectEqualStrings("first task", progress.description);
+
+    const progress_status = (try currentStatusAt(gpa, options, "2026-03-13T10:01:30Z", std.testing.io)).?;
+    defer progress_status.deinit(gpa);
+    try std.testing.expect(std.mem.containsAtLeast(u8, progress_status.todos, 1, "1. [-] first task"));
+
+    var reopened = try todoUndoAt(gpa, options, 1, "2026-03-13T10:02:00Z", std.testing.io);
+    defer reopened.deinit(gpa);
+
+    const reopened_status = (try currentStatusAt(gpa, options, "2026-03-13T10:02:30Z", std.testing.io)).?;
+    defer reopened_status.deinit(gpa);
+    try std.testing.expect(std.mem.containsAtLeast(u8, reopened_status.todos, 1, "1. [ ] first task"));
 }
 
 test "open target path resolves notes and todo files" {
